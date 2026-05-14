@@ -56,18 +56,31 @@ EOF
 }
 
 create_user() {
+    # Crear el grupo primero (en RHEL/Rocky, useradd -r no siempre crea el grupo)
+    if ! getent group netmon >/dev/null 2>&1; then
+        echo "[+] Creando grupo 'netmon'..."
+        groupadd -r netmon
+    else
+        echo "[=] Grupo 'netmon' ya existe"
+    fi
+
     if ! id -u netmon >/dev/null 2>&1; then
         echo "[+] Creando usuario 'netmon'..."
-        useradd -r -s /bin/false -d /var/log/netmon -M netmon
+        useradd -r -g netmon -s /sbin/nologin -d /var/log/netmon -M netmon \
+            || useradd -r -g netmon -s /bin/false -d /var/log/netmon -M netmon
     else
         echo "[=] Usuario 'netmon' ya existe"
+        # Asegurar que pertenece al grupo netmon (por si fue creado antes incorrectamente)
+        usermod -g netmon netmon 2>/dev/null || true
     fi
 }
 
 create_dirs() {
     echo "[+] Creando directorios..."
     mkdir -p /etc/netmon
-    mkdir -p /var/log/netmon/{latency,microcuts,connections}
+    mkdir -p /var/log/netmon/latency
+    mkdir -p /var/log/netmon/microcuts
+    mkdir -p /var/log/netmon/connections
     chown -R netmon:netmon /var/log/netmon
     chmod 755 /var/log/netmon
 }
