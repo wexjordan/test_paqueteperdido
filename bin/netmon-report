@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""
+netmon-report: Analizador consolidado de los 3 monitores netmon.
+
+Correlaciona eventos de:
+  - latency  (latencia TCP agregada)
+  - microcuts (microcortes UDP al ms)
+  - connections (caídas de conexiones TCP persistentes)
+
+Te permite responder:
+  - ¿Qué pasó ayer entre 02:00 y 04:00?
+  - ¿Cuál fue el peor incidente del mes?
+  - ¿Hubo correlación entre microcortes y caídas TCP?
+  - Top 10 horas más problemáticas.
+
+USO:
+  netmon-report summary --day 2026-05-13
+  netmon-report incidents --day 2026-05-13
+  netmon-report incidents --start 2026-05-01 --end 2026-05-13
+  netmon-report hourly --day 2026-05-13
+  netmon-report top --by severity --limit 10
+  netmon-report timeline --day 2026-05-13 --hour 14
+"""
+
+import argparse
+import csv
+import sys
+import re
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+
+# ANSI colors (se desactivan si no es tty)
+def use_color():
+    return sys.stdout.isatty()
+
+class C:
+    R = "\033[31m" if True else ""
+    Y = "\033[33m" if True else ""
+    G = "\033[32m" if True else ""
+    B = "\033[34m" if True else ""
+    DIM = "\033[2m" if True else ""
+    BOLD = "\033[1m" if True else ""
+    END = "\033[0m" if True else ""
+    @classmethod
+    def init(cls, enabled):
+        if not enabled:
+            for k in ["R","Y","G","B","DIM","BOLD","END"]:
+                setattr(cls, k, "")
+
+# ---------------------------- Loaders ----------------------------
+
+def parse_ts(s):
+    """Parse ISO timestamp, devuelve datetime con tz UTC."""
+    s = s.rstrip("Z")
+    # Manejar microsegundos opcionales
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        # Fallback manual
+        dt = datetime.strptime(s.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def load_latency_metrics(base_dir, day=None, start=None, end=None):
+    """Lee latency/metrics-*.csv. Devuelve lista de dicts."""
+    path = Path(base_dir) / "latency"
+    if not path.exists():
+        return []
+    rows = []
+    for f in sorted(path.glob("metrics-*.csv")):
+        date_str = f.stem.replace("metrics-", "")
+        if not date_in_range(date_str, day, start, end):
+            continue
+        with open(f) as fh:
+            for r in csv.DictReader(fh):
+                r["timestamp"] = parse_ts(r["timestamp_utc"])
+                for k in ["min_us","max_us","mean_us","p50_us","p95_us",
+                         "p99_us","stddev_us","jitter_us","loss_pct"]:
+                    r[k] = float(r[k])
+                r["samples"] = int(r["samples"])
+                r["source"] = "latency"
+                rows.append(r)
+    return rows
+
+def load_microcuts(base_dir, day=None, start=None, end=None):
+    """Lee microcuts/microcuts-*.log. Devuelve lista de eventos."""
+    path = Path(base_dir) / "microcuts"
+    if not path.exists():
+        return []
+    events = []
+    for f in sorted(path.glob("microcuts-*.log")):
+        date_str = f.stem.replace("microcuts-", "")
+        if not date_in_range(date_str, day, start, end):
+            continue
+        with open(f) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line: continue
+                parts = line.split("\t")
+                if len(parts) < 4: continue
+                ev = {"timestamp": parse_ts(parts[0]), "source": "microcuts"}
+                for p in parts[1:]:
+                    if "=" in p:
+                        k, v = p.split("=", 1)
+                        ev[k] = v
+                ev["duration_ms"] = float(ev.get("duration_ms", 0))
+                ev["lost"] = int(ev.get("lost", 0))
+                events.append(ev)
+    return events
+
+def load_microcuts_metrics(base_dir, day=None, start=None, end=None):
+    path = Path(base_dir) / "microcuts"
+    if not path.exists():
+        return []
+    rows = []
+    for f in sorted(path.glob("metrics-*.csv")):
+        date_str = f.stem.replace("metrics-", "")
+        if not date_in_range(date_str, day, start, end):
+            continue
+        with open(f) as fh:
+            for r in csv.DictReader(fh):
+                r["timestamp"] = parse_ts(r["timestamp_utc"])
+                for k in ["loss_pct","min_us","p50_us","p95_us","p99_us",
+                         "max_us","jitter_us","longest_cut_ms"]:
+                    r[k] = float(r[k])
+                for k in ["sent","received","lost","out_of_order","microcuts"]:
+                    r[k] = int(r[k])
+                r["source"] = "microcuts_metrics"
+                rows.append(r)
+    return rows
+
+def load_disconnects(base_dir, day=None, start=None, end=None):
+    """Lee connections/disconnects-*.log."""
+    path = Path(base_dir) / "connections"
+    if not path.exists():
+        return []
+    events = []
+    for f in sorted(path.glob("disconnects-*.log")):
+        date_str = f.stem.replace("disconnects-", "")
+        if not date_in_range(date_str, day, start, end):
+            continue
+        with open(f) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line: continue
+                parts = line.split("\t")
+                if len(parts) < 2: continue
+                ev = {"timestamp": parse_ts(parts[0]), "source": "connections"}
+                for p in parts[1:]:
+                    if "=" in p:
+                        k, v = p.split("=", 1)
+                        ev[k] = v
+                if "uptime_before_s" in ev:
+                    ev["uptime_before_s"] = float(ev["uptime_before_s"])
+                if "downtime_s" in ev:
+                    ev["downtime_s"] = float(ev["downtime_s"])
+                events.append(ev)
+    return events
+
+def load_events(base_dir, subdir, day=None, start=None, end=None):
+    path = Path(base_dir) / subdir
+    if not path.exists():
+        return []
+    events = []
+    for f in sorted(path.glob("events-*.log")):
+        date_str = f.stem.replace("events-", "")
+        if not date_in_range(date_str, day, start, end):
+            continue
+        with open(f) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line: continue
+                parts = line.split("\t", 2)
+                if len(parts) < 3: continue
+                events.append({
+                    "timestamp": parse_ts(parts[0]),
+                    "level": parts[1],
+                    "msg": parts[2],
+                    "source": subdir,
+                })
+    return events
+
+def date_in_range(date_str, day=None, start=None, end=None):
+    if day and date_str != day:
+        return False
+    if start and date_str < start:
+        return False
+    if end and date_str > end:
+        return False
+    return True
+
+# ---------------------------- Analysis ----------------------------
+
+def detect_incidents(base_dir, day=None, start=None, end=None,
+                     correlation_window_s=60):
+    """
+    Un INCIDENTE = ventana de tiempo donde ocurrieron eventos significativos.
+    Agrupa eventos cercanos (<correlation_window_s) en incidentes.
+    """
+    microcuts = load_microcuts(base_dir, day, start, end)
+    disconnects = [e for e in load_disconnects(base_dir, day, start, end)
+                   if e.get("type") in ("DISCONNECT", "STALL")]
+    lat_events = [e for e in load_events(base_dir, "latency", day, start, end)
+                  if e["level"] in ("WARNING", "ERROR")]
+
+    # Combinar todos los eventos en una sola lista cronológica
+    all_events = []
+    for ev in microcuts:
+        all_events.append({
+            "ts": ev["timestamp"], "kind": "microcut",
+            "detail": f"{ev['duration_ms']:.1f}ms perdidos ({ev['lost']} pkts)",
+            "severity": ev["duration_ms"],  # más largo = más severo
+        })
+    for ev in disconnects:
+        all_events.append({
+            "ts": ev["timestamp"], "kind": ev["type"].lower(),
+            "detail": f"conn={ev.get('conn','?')} error={ev.get('error','?')}",
+            "severity": ev.get("uptime_before_s", 0) and 100 or 50,
+        })
+    for ev in lat_events:
+        all_events.append({
+            "ts": ev["timestamp"], "kind": ev["level"].lower(),
+            "detail": ev["msg"][:80],
+            "severity": 30 if ev["level"] == "WARNING" else 70,
+        })
+
+    all_events.sort(key=lambda e: e["ts"])
+    if not all_events:
+        return []
+
+    # Agrupar en incidentes
+    incidents = []
+    current = {"start": all_events[0]["ts"], "end": all_events[0]["ts"],
+               "events": [all_events[0]]}
+    for ev in all_events[1:]:
+        if (ev["ts"] - current["end"]).total_seconds() <= correlation_window_s:
+            current["events"].append(ev)
+            current["end"] = ev["ts"]
+        else:
+            incidents.append(current)
+            current = {"start": ev["ts"], "end": ev["ts"], "events": [ev]}
+    incidents.append(current)
+
+    # Calcular severidad y categorías por incidente
+    for inc in incidents:
+        kinds = defaultdict(int)
+        for e in inc["events"]:
+            kinds[e["kind"]] += 1
+        inc["kinds"] = dict(kinds)
+        inc["duration_s"] = (inc["end"] - inc["start"]).total_seconds()
+        inc["count"] = len(inc["events"])
+        # Severidad: combinación de tipos + duración
+        sev = sum(e["severity"] for e in inc["events"])
+        # Bonus si hay correlación (varios tipos = más probable que sea real)
+        if len(kinds) >= 2:
+            sev *= 1.5
+        if "disconnect" in kinds:
+            sev *= 2  # caída TCP es lo más grave
+        inc["severity"] = sev
+
+    return incidents
+
+# ---------------------------- Renderers ----------------------------
+
+def fmt_us(us):
+    if us < 1000: return f"{us:.1f}µs"
+    if us < 1_000_000: return f"{us/1000:.2f}ms"
+    return f"{us/1_000_000:.2f}s"
+
+def fmt_duration(s):
+    if s < 60: return f"{s:.1f}s"
+    if s < 3600: return f"{s/60:.1f}min"
+    return f"{s/3600:.2f}h"
+
+def cmd_summary(args, base_dir):
+    """Resumen ejecutivo: lo más importante en una pantalla."""
+    lat = load_latency_metrics(base_dir, args.day, args.start, args.end)
+    udp_m = load_microcuts_metrics(base_dir, args.day, args.start, args.end)
+    cuts = load_microcuts(base_dir, args.day, args.start, args.end)
+    disc = load_disconnects(base_dir, args.day, args.start, args.end)
+    incidents = detect_incidents(base_dir, args.day, args.start, args.end)
+
+    period = args.day or f"{args.start or '...'} a {args.end or '...'}"
+    print()
+    print(f"{C.BOLD}═══════════════════════════════════════════════════════════════════{C.END}")
+    print(f"{C.BOLD}  RESUMEN NETMON - Período: {period}{C.END}")
+    print(f"{C.BOLD}═══════════════════════════════════════════════════════════════════{C.END}")
+    print()
+
+    # --- Latencia TCP ---
+    print(f"{C.B}▸ LATENCIA TCP{C.END}")
+    if lat:
+        p50s = [r["p50_us"] for r in lat]
+        p99s = [r["p99_us"] for r in lat]
+        maxs = [r["max_us"] for r in lat]
+        losses = [r["loss_pct"] for r in lat]
+        print(f"  Ventanas analizadas : {len(lat)}")
+        print(f"  p50 mediana         : {fmt_us(sorted(p50s)[len(p50s)//2])}")
+        print(f"  p99 mediana         : {fmt_us(sorted(p99s)[len(p99s)//2])}")
+        print(f"  p99 peor            : {C.R if max(p99s) > sorted(p99s)[len(p99s)//2]*5 else ''}{fmt_us(max(p99s))}{C.END}")
+        print(f"  max peor            : {fmt_us(max(maxs))}")
+        windows_with_loss = sum(1 for l in losses if l > 0)
+        if windows_with_loss:
+            print(f"  Ventanas con pérdida: {C.Y}{windows_with_loss}{C.END}")
+    else:
+        print(f"  {C.DIM}(sin datos){C.END}")
+    print()
+
+    # --- Microcortes UDP ---
+    print(f"{C.B}▸ MICROCORTES UDP (al milisegundo){C.END}")
+    if cuts:
+        durations = [c["duration_ms"] for c in cuts]
+        print(f"  Microcortes totales : {C.Y if len(cuts) > 10 else ''}{len(cuts)}{C.END}")
+        print(f"  Más corto           : {min(durations):.1f}ms")
+        print(f"  Más largo           : {C.R if max(durations) > 100 else C.Y}{max(durations):.1f}ms{C.END}")
+        # Distribución
+        short = sum(1 for d in durations if d < 10)
+        med = sum(1 for d in durations if 10 <= d < 100)
+        long = sum(1 for d in durations if d >= 100)
+        print(f"  Distribución        : <10ms: {short}  10-100ms: {med}  >100ms: {C.R if long else ''}{long}{C.END}")
+    else:
+        print(f"  {C.G}Ninguno detectado ✓{C.END}")
+    print()
+
+    # --- Caídas de conexiones TCP ---
+    print(f"{C.B}▸ CAÍDAS DE CONEXIONES TCP{C.END}")
+    discs = [d for d in disc if d.get("type") == "DISCONNECT"]
+    stalls = [d for d in disc if d.get("type") == "STALL"]
+    recs = [d for d in disc if d.get("type") == "RECONNECT"]
+    if discs or stalls:
+        print(f"  Disconnects         : {C.R}{len(discs)}{C.END}")
+        print(f"  Stalls (cuelgues)   : {C.Y}{len(stalls)}{C.END}")
+        print(f"  Reconexiones        : {len(recs)}")
+        if recs:
+            downtimes = [r["downtime_s"] for r in recs if "downtime_s" in r]
+            if downtimes:
+                print(f"  Downtime total      : {fmt_duration(sum(downtimes))}")
+                print(f"  Downtime más largo  : {C.R}{fmt_duration(max(downtimes))}{C.END}")
+        # Error más frecuente
+        errors = defaultdict(int)
+        for d in discs + stalls:
+            errors[d.get("error", "?")] += 1
+        if errors:
+            top_err = sorted(errors.items(), key=lambda x: -x[1])[0]
+            print(f"  Error más frecuente : {top_err[0]} ({top_err[1]}x)")
+    else:
+        print(f"  {C.G}Sin caídas ✓{C.END}")
+    print()
+
+    # --- Incidentes correlacionados ---
+    print(f"{C.B}▸ INCIDENTES CORRELACIONADOS{C.END}")
+    if incidents:
+        # Solo los serios (>1 evento o disconnect)
+        serious = [i for i in incidents if i["count"] > 1 or
+                   "disconnect" in i["kinds"]]
+        print(f"  Total agrupados     : {len(incidents)}")
+        print(f"  Incidentes serios   : {C.R if len(serious)>5 else C.Y}{len(serious)}{C.END}")
+        if serious:
+            top = sorted(serious, key=lambda i: -i["severity"])[:3]
+            print(f"\n  TOP 3 más severos:")
+            for inc in top:
+                k_str = ", ".join(f"{k}:{v}" for k,v in inc["kinds"].items())
+                print(f"    • {inc['start'].strftime('%H:%M:%S')} → "
+                      f"{inc['end'].strftime('%H:%M:%S')} "
+                      f"({fmt_duration(inc['duration_s'])}, {inc['count']} eventos: {k_str})")
+    else:
+        print(f"  {C.G}Sin incidentes ✓{C.END}")
+    print()
+    print(f"{C.DIM}  Use 'netmon-report incidents' para ver el detalle completo{C.END}")
+    print(f"{C.DIM}  Use 'netmon-report hourly' para ver el patrón por hora{C.END}")
+    print()
+
+def cmd_incidents(args, base_dir):
+    incidents = detect_incidents(base_dir, args.day, args.start, args.end,
+                                 args.correlation_window)
+    if not incidents:
+        print(f"{C.G}Sin incidentes en el período.{C.END}")
+        return
+    # Ordenar por severidad
+    incidents.sort(key=lambda i: -i["severity"])
+    if args.limit:
+        incidents = incidents[:args.limit]
+    else:
+        # Por defecto mostrar solo serios
+        incidents = [i for i in incidents if i["count"] > 1
+                     or "disconnect" in i["kinds"]
+                     or any(e["kind"] == "microcut" and "ms" in e["detail"]
+                            and float(e["detail"].split("ms")[0]) > 50
+                            for e in i["events"])]
+
+    print()
+    print(f"{C.BOLD}═══ {len(incidents)} INCIDENTES (ordenados por severidad) ═══{C.END}\n")
+    for i, inc in enumerate(incidents, 1):
+        sev_color = C.R if inc["severity"] > 200 else (C.Y if inc["severity"] > 100 else "")
+        k_str = ", ".join(f"{k}:{v}" for k,v in inc["kinds"].items())
+        print(f"{sev_color}#{i} [{inc['start'].strftime('%Y-%m-%d %H:%M:%S')} → "
+              f"{inc['end'].strftime('%H:%M:%S')}] "
+              f"duración: {fmt_duration(inc['duration_s'])}  "
+              f"severidad: {inc['severity']:.0f}{C.END}")
+        print(f"   Categorías: {k_str}  |  Eventos: {inc['count']}")
+        if args.verbose:
+            for e in inc["events"][:10]:
+                print(f"   {C.DIM}{e['ts'].strftime('%H:%M:%S.%f')[:-3]} "
+                      f"[{e['kind']:>10}] {e['detail']}{C.END}")
+            if len(inc["events"]) > 10:
+                print(f"   {C.DIM}... y {len(inc['events'])-10} más{C.END}")
+        print()
+
+def cmd_hourly(args, base_dir):
+    """Vista por hora del día/rango."""
+    lat = load_latency_metrics(base_dir, args.day, args.start, args.end)
+    cuts = load_microcuts(base_dir, args.day, args.start, args.end)
+    disc = load_disconnects(base_dir, args.day, args.start, args.end)
+
+    by_hour = defaultdict(lambda: {
+        "lat_p99": [], "lat_max": [], "lat_loss": [],
+        "microcuts": 0, "microcut_longest_ms": 0,
+        "disconnects": 0, "stalls": 0, "downtime_s": 0,
+    })
+    for r in lat:
+        h = r["timestamp"].strftime("%Y-%m-%d %H:00")
+        by_hour[h]["lat_p99"].append(r["p99_us"])
+        by_hour[h]["lat_max"].append(r["max_us"])
+        by_hour[h]["lat_loss"].append(r["loss_pct"])
+    for c in cuts:
+        h = c["timestamp"].strftime("%Y-%m-%d %H:00")
+        by_hour[h]["microcuts"] += 1
+        if c["duration_ms"] > by_hour[h]["microcut_longest_ms"]:
+            by_hour[h]["microcut_longest_ms"] = c["duration_ms"]
+    for d in disc:
+        h = d["timestamp"].strftime("%Y-%m-%d %H:00")
+        if d.get("type") == "DISCONNECT":
+            by_hour[h]["disconnects"] += 1
+        elif d.get("type") == "STALL":
+            by_hour[h]["stalls"] += 1
+        elif d.get("type") == "RECONNECT":
+            by_hour[h]["downtime_s"] += d.get("downtime_s", 0)
+
+    if not by_hour:
+        print(f"{C.DIM}Sin datos en el período{C.END}")
+        return
+
+    print()
+    print(f"{C.BOLD}VISTA POR HORA{C.END}")
+    print("─" * 95)
+    print(f"  {'Hora UTC':<20} {'p99 med':>10} {'max':>10} {'µcuts':>7} {'cut max':>9} {'discs':>6} {'stalls':>7} {'down':>8}")
+    print("─" * 95)
+    for h in sorted(by_hour.keys()):
+        d = by_hour[h]
+        p99_med = sorted(d["lat_p99"])[len(d["lat_p99"])//2] if d["lat_p99"] else 0
+        max_w = max(d["lat_max"]) if d["lat_max"] else 0
+        # Flag visual
+        flag = ""
+        if d["disconnects"] > 0:
+            flag = f" {C.R}●{C.END}"
+        elif d["stalls"] > 0 or d["microcuts"] > 50:
+            flag = f" {C.Y}●{C.END}"
+        elif d["microcuts"] > 0:
+            flag = f" {C.DIM}●{C.END}"
+        print(f"  {h:<20} {fmt_us(p99_med):>10} {fmt_us(max_w):>10} "
+              f"{d['microcuts']:>7} {d['microcut_longest_ms']:>7.1f}ms "
+              f"{d['disconnects']:>6} {d['stalls']:>7} "
+              f"{fmt_duration(d['downtime_s']):>8}{flag}")
+    print("─" * 95)
+    print(f"  {C.R}●{C.END} hora con disconnects   "
+          f"{C.Y}●{C.END} hora degradada   "
+          f"{C.DIM}●{C.END} microcortes leves")
+    print()
+
+def cmd_timeline(args, base_dir):
+    """Timeline detallado de una hora específica."""
+    if not args.day or args.hour is None:
+        print("[!] timeline requiere --day y --hour", file=sys.stderr)
+        sys.exit(1)
+    cuts = load_microcuts(base_dir, args.day)
+    disc = load_disconnects(base_dir, args.day)
+    lat_ev = load_events(base_dir, "latency", args.day)
+    udp_ev = load_events(base_dir, "microcuts", args.day)
+
+    hour_filter = lambda t: t.hour == args.hour
+    all_events = []
+    for c in cuts:
+        if hour_filter(c["timestamp"]):
+            all_events.append((c["timestamp"], "MCUT",
+                              f"{c['duration_ms']:.1f}ms perdidos ({c['lost']} pkts)"))
+    for d in disc:
+        if hour_filter(d["timestamp"]):
+            t = d.get("type", "?")
+            extra = ""
+            if "error" in d:
+                extra = f" error={d['error']}"
+            if "downtime_s" in d:
+                extra += f" downtime={d['downtime_s']:.1f}s"
+            if "uptime_before_s" in d:
+                extra += f" uptime_prev={d['uptime_before_s']:.1f}s"
+            all_events.append((d["timestamp"], t,
+                              f"conn={d.get('conn','?')}{extra}"))
+    for e in lat_ev + udp_ev:
+        if hour_filter(e["timestamp"]) and e["level"] in ("WARNING","ERROR"):
+            all_events.append((e["timestamp"], e["level"],
+                              f"[{e['source']}] {e['msg']}"))
+
+    all_events.sort(key=lambda x: x[0])
+    print(f"\n{C.BOLD}TIMELINE — {args.day} hora {args.hour:02d}:00 UTC{C.END}")
+    print("─" * 90)
+    if not all_events:
+        print(f"{C.G}  Sin eventos en esta hora ✓{C.END}")
+    for ts, kind, detail in all_events:
+        color = C.R if kind in ("DISCONNECT","ERROR") else \
+                C.Y if kind in ("STALL","WARNING","MCUT") else ""
+        print(f"  {ts.strftime('%H:%M:%S.%f')[:-3]}  {color}[{kind:>10}]{C.END}  {detail}")
+    print()
+
+def cmd_top(args, base_dir):
+    """Top N de algo."""
+    if args.by == "microcuts":
+        cuts = load_microcuts(base_dir, args.day, args.start, args.end)
+        cuts.sort(key=lambda c: -c["duration_ms"])
+        print(f"\n{C.BOLD}TOP {args.limit} MICROCORTES MÁS LARGOS{C.END}\n")
+        for i, c in enumerate(cuts[:args.limit], 1):
+            print(f"  #{i:2d}  {c['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}  "
+                  f"{C.R}{c['duration_ms']:>7.1f}ms{C.END}  "
+                  f"({c['lost']} paquetes seq={c.get('seqs','?')})")
+    elif args.by == "downtime":
+        disc = load_disconnects(base_dir, args.day, args.start, args.end)
+        recs = [d for d in disc if d.get("type") == "RECONNECT"]
+        recs.sort(key=lambda d: -d.get("downtime_s", 0))
+        print(f"\n{C.BOLD}TOP {args.limit} DOWNTIMES MÁS LARGOS{C.END}\n")
+        for i, d in enumerate(recs[:args.limit], 1):
+            print(f"  #{i:2d}  {d['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}  "
+                  f"{C.R}{fmt_duration(d['downtime_s'])}{C.END}  "
+                  f"conn={d.get('conn','?')}")
+    elif args.by == "latency":
+        lat = load_latency_metrics(base_dir, args.day, args.start, args.end)
+        lat.sort(key=lambda r: -r["max_us"])
+        print(f"\n{C.BOLD}TOP {args.limit} VENTANAS CON MAX LATENCIA{C.END}\n")
+        for i, r in enumerate(lat[:args.limit], 1):
+            print(f"  #{i:2d}  {r['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}  "
+                  f"max={C.R}{fmt_us(r['max_us'])}{C.END} "
+                  f"p99={fmt_us(r['p99_us'])} p50={fmt_us(r['p50_us'])} "
+                  f"loss={r['loss_pct']:.2f}%")
+    elif args.by == "severity":
+        incs = detect_incidents(base_dir, args.day, args.start, args.end)
+        incs.sort(key=lambda i: -i["severity"])
+        print(f"\n{C.BOLD}TOP {args.limit} INCIDENTES POR SEVERIDAD{C.END}\n")
+        for i, inc in enumerate(incs[:args.limit], 1):
+            k_str = ", ".join(f"{k}:{v}" for k,v in inc["kinds"].items())
+            print(f"  #{i:2d}  {inc['start'].strftime('%Y-%m-%d %H:%M:%S')}  "
+                  f"sev={C.R}{inc['severity']:.0f}{C.END}  "
+                  f"dur={fmt_duration(inc['duration_s'])}  ({k_str})")
+    print()
+
+def main():
+    p = argparse.ArgumentParser(
+        description="netmon-report: analizador consolidado",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+EJEMPLOS:
+  netmon-report summary --day 2026-05-13
+  netmon-report incidents --day 2026-05-13 --verbose
+  netmon-report hourly --day 2026-05-13
+  netmon-report timeline --day 2026-05-13 --hour 14
+  netmon-report top --by microcuts --limit 20
+  netmon-report top --by downtime --start 2026-05-01 --end 2026-05-13
+""")
+    p.add_argument("--base-dir", default="/var/log/netmon",
+                   help="Directorio base donde están latency/, microcuts/, connections/")
+    p.add_argument("--no-color", action="store_true")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("summary", help="Resumen ejecutivo")
+    s.add_argument("--day"); s.add_argument("--start"); s.add_argument("--end")
+
+    i = sub.add_parser("incidents", help="Incidentes correlacionados")
+    i.add_argument("--day"); i.add_argument("--start"); i.add_argument("--end")
+    i.add_argument("--limit", type=int, help="Limitar a N incidentes")
+    i.add_argument("--verbose", action="store_true", help="Mostrar todos los eventos")
+    i.add_argument("--correlation-window", type=int, default=60,
+                   help="Segundos para agrupar eventos en un incidente")
+
+    h = sub.add_parser("hourly", help="Vista por hora")
+    h.add_argument("--day"); h.add_argument("--start"); h.add_argument("--end")
+
+    t = sub.add_parser("timeline", help="Timeline detallado de una hora")
+    t.add_argument("--day", required=True)
+    t.add_argument("--hour", type=int, required=True, help="Hora UTC (0-23)")
+
+    tp = sub.add_parser("top", help="Top N por métrica")
+    tp.add_argument("--by", choices=["microcuts","downtime","latency","severity"],
+                    default="severity")
+    tp.add_argument("--limit", type=int, default=10)
+    tp.add_argument("--day"); tp.add_argument("--start"); tp.add_argument("--end")
+
+    args = p.parse_args()
+    C.init(not args.no_color and use_color())
+
+    base_dir = args.base_dir
+    if not Path(base_dir).exists():
+        print(f"[!] El directorio {base_dir} no existe", file=sys.stderr)
+        sys.exit(1)
+
+    if args.cmd == "summary": cmd_summary(args, base_dir)
+    elif args.cmd == "incidents": cmd_incidents(args, base_dir)
+    elif args.cmd == "hourly": cmd_hourly(args, base_dir)
+    elif args.cmd == "timeline": cmd_timeline(args, base_dir)
+    elif args.cmd == "top": cmd_top(args, base_dir)
+
+if __name__ == "__main__":
+    main()

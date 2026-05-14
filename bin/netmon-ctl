@@ -1,0 +1,205 @@
+#!/bin/bash
+#
+# netmon-ctl: Panel de control de la suite netmon.
+# Maneja los 3 servicios systemd y proporciona acceso rápido al analizador.
+#
+# Uso:
+#   netmon-ctl start          # arranca los 3 monitores
+#   netmon-ctl stop           # detiene los 3
+#   netmon-ctl restart
+#   netmon-ctl status         # estado de los 3
+#   netmon-ctl logs [N]       # tail de los logs operacionales
+#   netmon-ctl report ...     # pasa al netmon-report
+#   netmon-ctl test           # prueba conectividad al servidor remoto
+
+set -e
+
+SERVICES=(netmon-latency netmon-microcuts netmon-connections)
+CONFIG="/etc/netmon/netmon.conf"
+NETMON_REPORT="/usr/local/bin/netmon-report"
+
+if [ -f "$CONFIG" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG"
+fi
+
+REMOTE_HOST="${REMOTE_HOST:-}"
+REMOTE_PORT="${REMOTE_PORT:-9999}"
+
+color_red()    { printf "\033[31m%s\033[0m" "$1"; }
+color_green()  { printf "\033[32m%s\033[0m" "$1"; }
+color_yellow() { printf "\033[33m%s\033[0m" "$1"; }
+color_bold()   { printf "\033[1m%s\033[0m" "$1"; }
+
+cmd_start() {
+    color_bold "Iniciando servicios netmon..."
+    echo
+    for svc in "${SERVICES[@]}"; do
+        printf "  %-30s " "$svc"
+        if sudo systemctl start "$svc"; then
+            color_green "OK"; echo
+        else
+            color_red "FAIL"; echo
+        fi
+    done
+}
+
+cmd_stop() {
+    color_bold "Deteniendo servicios netmon..."
+    echo
+    for svc in "${SERVICES[@]}"; do
+        printf "  %-30s " "$svc"
+        sudo systemctl stop "$svc" 2>/dev/null && color_green "OK" || color_yellow "(no estaba activo)"
+        echo
+    done
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_status() {
+    color_bold "Estado de servicios netmon"
+    echo
+    echo "═══════════════════════════════════════════════════════════════════"
+    for svc in "${SERVICES[@]}"; do
+        if systemctl is-active --quiet "$svc"; then
+            status=$(color_green "● ACTIVO")
+            uptime=$(systemctl show -p ActiveEnterTimestamp --value "$svc")
+            extra=" desde $uptime"
+        else
+            status=$(color_red "✗ DETENIDO")
+            extra=""
+        fi
+        printf "  %-25s %s%s\n" "$svc" "$status" "$extra"
+    done
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo
+    color_bold "Configuración actual:"
+    echo
+    echo "  Host remoto : ${REMOTE_HOST:-<no configurado>}"
+    echo "  Puerto      : $REMOTE_PORT"
+    echo "  Logs        : /var/log/netmon/"
+    echo "  Config      : $CONFIG"
+    echo
+
+    # Conteo rápido de eventos hoy
+    today=$(date -u +%Y-%m-%d)
+    color_bold "Eventos hoy ($today UTC):"
+    echo
+    cuts=$(grep -c "" /var/log/netmon/microcuts/microcuts-$today.log 2>/dev/null || echo 0)
+    discs=$(grep -c DISCONNECT /var/log/netmon/connections/disconnects-$today.log 2>/dev/null || echo 0)
+    stalls=$(grep -c STALL /var/log/netmon/connections/disconnects-$today.log 2>/dev/null || echo 0)
+    warns=$(grep -c WARNING /var/log/netmon/latency/events-$today.log 2>/dev/null || echo 0)
+    echo "  Microcortes        : $cuts"
+    echo "  Caídas TCP         : $discs"
+    echo "  Stalls TCP         : $stalls"
+    echo "  Alertas de latencia: $warns"
+    echo
+}
+
+cmd_logs() {
+    local n="${1:-50}"
+    color_bold "Últimas $n líneas de logs operacionales:"
+    echo
+    for svc in "${SERVICES[@]}"; do
+        echo "═══ $svc ═══"
+        sudo journalctl -u "$svc" -n "$n" --no-pager 2>/dev/null | tail -n "$n" || echo "(sin logs)"
+        echo
+    done
+}
+
+cmd_test() {
+    if [ -z "$REMOTE_HOST" ]; then
+        color_red "ERROR: REMOTE_HOST no configurado en $CONFIG"
+        echo
+        exit 1
+    fi
+    color_bold "Probando conectividad a $REMOTE_HOST:$REMOTE_PORT"
+    echo
+    printf "  TCP : "
+    if timeout 3 bash -c "</dev/tcp/$REMOTE_HOST/$REMOTE_PORT" 2>/dev/null; then
+        color_green "OK"
+    else
+        color_red "FAIL — el servidor netmon-server no responde en TCP"
+    fi
+    echo
+    printf "  UDP : "
+    # Probar UDP con nc si está disponible
+    if command -v nc >/dev/null; then
+        if echo "test" | timeout 2 nc -u -w 2 "$REMOTE_HOST" "$REMOTE_PORT" 2>/dev/null | grep -q test; then
+            color_green "OK"
+        else
+            color_yellow "no respondió (puede ser firewall UDP o servidor no escucha UDP)"
+        fi
+    else
+        color_yellow "(instala 'nc' para probar UDP)"
+    fi
+    echo
+    printf "  Ping : "
+    if ping -c 1 -W 2 "$REMOTE_HOST" >/dev/null 2>&1; then
+        rtt=$(ping -c 3 -W 2 "$REMOTE_HOST" | tail -1 | awk -F'/' '{print $5}')
+        color_green "OK (RTT promedio: ${rtt}ms)"
+    else
+        color_red "FAIL (ICMP bloqueado o host no responde)"
+    fi
+    echo
+}
+
+cmd_report() {
+    shift  # quitar "report"
+    exec "$NETMON_REPORT" "$@"
+}
+
+cmd_help() {
+    cat <<EOF
+$(color_bold "netmon-ctl") — Panel de control de la suite netmon
+
+USO:
+  netmon-ctl <comando> [opciones]
+
+COMANDOS DE SERVICIO:
+  start              Inicia los 3 monitores (latency, microcuts, connections)
+  stop               Detiene los 3 monitores
+  restart            Reinicia los 3 monitores
+  status             Muestra estado y resumen del día
+  logs [N]           Últimas N líneas de logs operacionales (default: 50)
+  test               Prueba conectividad al servidor remoto
+
+ANÁLISIS:
+  report summary --day YYYY-MM-DD
+  report incidents --day YYYY-MM-DD [--verbose]
+  report hourly --day YYYY-MM-DD
+  report timeline --day YYYY-MM-DD --hour H
+  report top --by [microcuts|downtime|latency|severity] --limit N
+
+EJEMPLOS:
+  netmon-ctl status
+  netmon-ctl test
+  netmon-ctl report summary --day $(date -u +%Y-%m-%d)
+  netmon-ctl report incidents --day $(date -u +%Y-%m-%d) --verbose
+  netmon-ctl report hourly --start 2026-05-01 --end 2026-05-13
+
+Configuración: $CONFIG
+Logs:          /var/log/netmon/
+EOF
+}
+
+case "${1:-help}" in
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart ;;
+    status) cmd_status ;;
+    logs) cmd_logs "${2:-50}" ;;
+    test) cmd_test ;;
+    report) cmd_report "$@" ;;
+    help|--help|-h|"") cmd_help ;;
+    *)
+        color_red "Comando desconocido: $1"
+        echo
+        cmd_help
+        exit 1
+        ;;
+esac

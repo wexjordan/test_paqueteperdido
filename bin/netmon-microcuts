@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""
+netmon-microcuts: Monitor UDP de alta frecuencia para detectar
+microdesconexiones al milisegundo.
+
+Genera (en --log-dir):
+  metrics-YYYY-MM-DD.csv     Métricas agregadas por ventana
+  microcuts-YYYY-MM-DD.log   Cada microdesconexión con duración exacta
+  events-YYYY-MM-DD.log      Eventos importantes
+  microcuts.log              Log operacional
+"""
+
+import argparse
+import socket
+import struct
+import time
+import threading
+import statistics
+import signal
+import sys
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
+
+RUNNING = True
+def stop(*_):
+    global RUNNING
+    RUNNING = False
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+
+PACKET_HEADER = struct.Struct("!QQ")
+
+def percentile(sd, p):
+    if not sd: return 0
+    k = (len(sd)-1)*(p/100.0)
+    f = int(k); c = min(f+1, len(sd)-1)
+    if f == c: return sd[f]
+    return sd[f] + (sd[c]-sd[f])*(k-f)
+
+class State:
+    def __init__(self):
+        self.send_times = {}
+        self.received_seqs = set()
+        self.rtts = []
+        self.out_of_order = 0
+        self.last_seq_received = -1
+        self.lock = threading.Lock()
+
+def sender(sock, addr, rate, payload_size, state):
+    interval_ns = int(1_000_000_000 / rate)
+    pad = b"\x00" * max(0, payload_size - PACKET_HEADER.size)
+    seq = 0
+    next_send = time.perf_counter_ns()
+    while RUNNING:
+        now = time.perf_counter_ns()
+        if now < next_send:
+            if next_send - now > 200_000:
+                time.sleep((next_send-now)/1_000_000_000*0.8)
+            continue
+        t_send = time.perf_counter_ns()
+        pkt = PACKET_HEADER.pack(seq, t_send) + pad
+        try:
+            sock.sendto(pkt, addr)
+            with state.lock:
+                state.send_times[seq] = t_send
+        except OSError:
+            pass
+        seq += 1
+        next_send += interval_ns
+        if t_send - next_send > 100_000_000:
+            next_send = t_send + interval_ns
+
+def receiver(sock, state):
+    sock.settimeout(0.5)
+    while RUNNING:
+        try:
+            data, _ = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        t_recv = time.perf_counter_ns()
+        if len(data) < PACKET_HEADER.size:
+            continue
+        seq, t_send = PACKET_HEADER.unpack_from(data)
+        with state.lock:
+            if seq in state.send_times:
+                rtt = t_recv - state.send_times.pop(seq)
+                state.rtts.append(rtt)
+                state.received_seqs.add(seq)
+                if seq < state.last_seq_received:
+                    state.out_of_order += 1
+                else:
+                    state.last_seq_received = seq
+
+def aggregator(state, args, log_dir, logger):
+    window = args.window
+    rate = args.rate
+    burst_threshold = args.burst_threshold
+
+    metrics_fh = None
+    current_date = None
+
+    def open_files():
+        nonlocal metrics_fh, current_date
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != current_date:
+            if metrics_fh: metrics_fh.close()
+            current_date = today
+            path = log_dir / f"metrics-{today}.csv"
+            new = not path.exists()
+            metrics_fh = open(path, "a", buffering=1)
+            if new:
+                metrics_fh.write("timestamp_utc,sent,received,lost,loss_pct,"
+                                 "min_us,p50_us,p95_us,p99_us,max_us,jitter_us,"
+                                 "out_of_order,microcuts,longest_cut_ms\n")
+
+    def log_event(level, msg):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        with open(log_dir / f"events-{today}.log", "a") as f:
+            f.write(f"{ts}\t{level}\t{msg}\n")
+        logger.log(getattr(logging, level), msg)
+
+    def log_microcut(start_seq, end_seq, duration_ms):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        with open(log_dir / f"microcuts-{today}.log", "a") as f:
+            f.write(f"{ts}\tseqs={start_seq}-{end_seq}\t"
+                    f"lost={end_seq-start_seq+1}\tduration_ms={duration_ms:.2f}\n")
+
+    open_files()
+    last_processed_seq = -1
+
+    while RUNNING:
+        time.sleep(window)
+        open_files()
+        with state.lock:
+            rtts = state.rtts; state.rtts = []
+            received = state.received_seqs.copy(); state.received_seqs = set()
+            out_of_order = state.out_of_order; state.out_of_order = 0
+            cutoff = time.perf_counter_ns() - 2_000_000_000
+            old_lost = [s for s,t in state.send_times.items() if t < cutoff]
+            for s in old_lost: del state.send_times[s]
+
+        if received:
+            max_seq = max(received)
+            min_seq = max(last_processed_seq + 1, min(received))
+            all_in_range = set(range(min_seq, max_seq+1))
+            lost_seqs = sorted(all_in_range - received)
+            microcuts = []
+            if lost_seqs:
+                run_start = lost_seqs[0]; run_end = lost_seqs[0]
+                for s in lost_seqs[1:]:
+                    if s == run_end+1:
+                        run_end = s
+                    else:
+                        microcuts.append((run_start, run_end))
+                        run_start = run_end = s
+                microcuts.append((run_start, run_end))
+            real_cuts = [(s,e) for s,e in microcuts if (e-s+1) >= burst_threshold]
+            sent_count = max_seq - min_seq + 1
+            received_count = len(received & all_in_range)
+            lost_count = len(lost_seqs)
+            last_processed_seq = max_seq
+        else:
+            sent_count = received_count = lost_count = 0
+            real_cuts = []
+
+        loss_pct = lost_count/sent_count*100 if sent_count else 0
+        longest_cut_ms = 0
+        if real_cuts:
+            longest = max((e-s+1) for s,e in real_cuts)
+            longest_cut_ms = longest*1000/rate
+
+        if rtts:
+            s_rtts = sorted(rtts)
+            min_us = s_rtts[0]/1000; max_us = s_rtts[-1]/1000
+            p50 = percentile(s_rtts, 50)/1000
+            p95 = percentile(s_rtts, 95)/1000
+            p99 = percentile(s_rtts, 99)/1000
+            jitter = (sum(abs(rtts[i]-rtts[i-1]) for i in range(1,len(rtts)))
+                      / max(1,len(rtts)-1)) / 1000
+        else:
+            min_us = max_us = p50 = p95 = p99 = jitter = 0
+
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        metrics_fh.write(f"{ts},{sent_count},{received_count},{lost_count},"
+                         f"{loss_pct:.3f},{min_us:.2f},{p50:.2f},{p95:.2f},"
+                         f"{p99:.2f},{max_us:.2f},{jitter:.2f},"
+                         f"{out_of_order},{len(real_cuts)},{longest_cut_ms:.2f}\n")
+
+        for start, end in real_cuts:
+            count = end - start + 1
+            duration_ms = count * 1000 / rate
+            log_microcut(start, end, duration_ms)
+
+        if real_cuts:
+            log_event("WARNING",
+                      f"MICROCORTES: {len(real_cuts)} "
+                      f"(la más larga: {longest_cut_ms:.2f}ms, "
+                      f"pérdida: {loss_pct:.2f}%)")
+        if out_of_order > rate * 0.01:
+            log_event("WARNING", f"REORDENAMIENTO: {out_of_order} paquetes")
+        if p99 > args.spike_threshold_us:
+            log_event("WARNING", f"PICO p99={p99:.2f}µs max={max_us:.2f}µs")
+
+    if metrics_fh:
+        metrics_fh.close()
+
+def setup_logger(log_dir, name):
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    h = RotatingFileHandler(Path(log_dir)/f"{name}.log",
+                            maxBytes=10*1024*1024, backupCount=5)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(h)
+    return logger
+
+def main():
+    p = argparse.ArgumentParser(description="netmon-microcuts: monitor UDP de microcortes")
+    p.add_argument("--host", required=True)
+    p.add_argument("--port", type=int, default=9999)
+    p.add_argument("--rate", type=int, default=1000,
+                   help="Pings por segundo. 1000=res 1ms")
+    p.add_argument("--window", type=int, default=10)
+    p.add_argument("--payload-size", type=int, default=64)
+    p.add_argument("--burst-threshold", type=int, default=2)
+    p.add_argument("--spike-threshold-us", type=float, default=100000)
+    p.add_argument("--log-dir", default="/var/log/netmon/microcuts")
+    args = p.parse_args()
+
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(args.log_dir, "microcuts")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4*1024*1024)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4*1024*1024)
+
+    state = State()
+    addr = (args.host, args.port)
+
+    logger.info(f"Iniciado | dest={args.host}:{args.port} | rate={args.rate}/s | "
+                f"res={1000/args.rate:.2f}ms | burst_threshold={args.burst_threshold}")
+
+    threading.Thread(target=sender,
+                     args=(sock, addr, args.rate, args.payload_size, state),
+                     daemon=True).start()
+    threading.Thread(target=receiver, args=(sock, state), daemon=True).start()
+    threading.Thread(target=aggregator,
+                     args=(state, args, log_dir, logger), daemon=True).start()
+
+    while RUNNING:
+        time.sleep(0.5)
+
+    logger.info("Deteniendo")
+    sock.close()
+    time.sleep(1)
+
+if __name__ == "__main__":
+    main()

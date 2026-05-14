@@ -1,0 +1,30 @@
+[Unit]
+Description=netmon latency monitor (TCP RTT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=netmon
+Group=netmon
+EnvironmentFile=/etc/netmon/netmon.conf
+ExecStart=/usr/local/bin/netmon-latency \
+    --host ${REMOTE_HOST} \
+    --port ${REMOTE_PORT} \
+    --interval ${LATENCY_INTERVAL} \
+    --window ${LATENCY_WINDOW} \
+    --log-dir /var/log/netmon/latency
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/netmon
+ProtectHome=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

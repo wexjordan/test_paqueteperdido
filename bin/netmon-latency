@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""
+netmon-latency: Monitor continuo de latencia TCP entre dos servidores.
+
+Mantiene una conexión TCP persistente y envía heartbeats periódicos.
+Mide RTT con precisión de microsegundos y agrega por ventanas.
+
+Genera (en --log-dir):
+  metrics-YYYY-MM-DD.csv   Métricas agregadas por ventana
+  events-YYYY-MM-DD.log    Anomalías detectadas
+  latency.log              Log operacional
+"""
+
+import argparse
+import socket
+import struct
+import time
+import os
+import sys
+import signal
+import statistics
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
+
+RUNNING = True
+def stop(*_):
+    global RUNNING
+    RUNNING = False
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+
+def percentile(sorted_data, p):
+    if not sorted_data:
+        return 0
+    k = (len(sorted_data) - 1) * (p / 100.0)
+    f = int(k)
+    c = min(f + 1, len(sorted_data) - 1)
+    if f == c:
+        return sorted_data[f]
+    return sorted_data[f] + (sorted_data[c] - sorted_data[f]) * (k - f)
+
+def compute_jitter(rtts):
+    if len(rtts) < 2:
+        return 0
+    return sum(abs(rtts[i]-rtts[i-1]) for i in range(1,len(rtts))) / (len(rtts)-1)
+
+def connect(host, port, timeout):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    s.settimeout(timeout)
+    s.connect((host, port))
+    return s
+
+def ping_once(sock, payload):
+    t0 = time.perf_counter_ns()
+    sock.sendall(payload)
+    remaining = len(payload)
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError("peer cerró")
+        remaining -= len(chunk)
+    return time.perf_counter_ns() - t0
+
+def run(args, logger):
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    payload = struct.pack("!Q", 0) + b"\x00" * max(0, args.payload_size - 8)
+
+    baseline_p99 = None
+    baseline_samples = []
+
+    sock = None
+    last_attempt = 0
+    lost_at = None
+    current_date = None
+    metrics_fh = None
+
+    def open_metrics():
+        nonlocal metrics_fh, current_date
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != current_date:
+            if metrics_fh:
+                metrics_fh.close()
+            current_date = today
+            path = log_dir / f"metrics-{today}.csv"
+            new = not path.exists()
+            metrics_fh = open(path, "a", buffering=1)
+            if new:
+                metrics_fh.write("timestamp_utc,samples,min_us,max_us,mean_us,"
+                                 "p50_us,p95_us,p99_us,stddev_us,jitter_us,loss_pct\n")
+
+    def log_event(level, msg):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(log_dir / f"events-{today}.log", "a") as f:
+            f.write(f"{ts}\t{level}\t{msg}\n")
+        logger.log(getattr(logging, level), msg)
+
+    open_metrics()
+    logger.info(f"Iniciado | dest={args.host}:{args.port} | "
+                f"interval={args.interval}s window={args.window}s")
+
+    win_start = time.monotonic()
+    win_rtts = []
+    win_errors = 0
+    win_attempts = 0
+
+    while RUNNING:
+        if sock is None:
+            now = time.monotonic()
+            if now - last_attempt < args.reconnect_delay:
+                time.sleep(0.5)
+                continue
+            last_attempt = now
+            try:
+                sock = connect(args.host, args.port, args.timeout)
+                if lost_at:
+                    downtime = time.monotonic() - lost_at
+                    log_event("WARNING", f"RECONECTADO tras {downtime:.1f}s")
+                    lost_at = None
+                else:
+                    log_event("INFO", f"Conectado a {args.host}:{args.port}")
+            except (socket.timeout, ConnectionRefusedError, OSError) as e:
+                if lost_at is None:
+                    lost_at = time.monotonic()
+                    log_event("ERROR", f"CAÍDA: no se puede conectar: {e}")
+                time.sleep(args.reconnect_delay)
+                continue
+
+        win_attempts += 1
+        try:
+            rtt = ping_once(sock, payload)
+            win_rtts.append(rtt)
+        except (socket.timeout, ConnectionError, OSError) as e:
+            win_errors += 1
+            log_event("ERROR", f"Error ping: {e}")
+            try: sock.close()
+            except: pass
+            sock = None
+            if lost_at is None:
+                lost_at = time.monotonic()
+            continue
+
+        if time.monotonic() - win_start >= args.window:
+            open_metrics()
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if win_rtts:
+                s_rtts = sorted(win_rtts)
+                min_us = s_rtts[0]/1000
+                max_us = s_rtts[-1]/1000
+                mean_us = statistics.mean(win_rtts)/1000
+                stddev_us = (statistics.stdev(win_rtts) if len(win_rtts)>1 else 0)/1000
+                p50 = percentile(s_rtts, 50)/1000
+                p95 = percentile(s_rtts, 95)/1000
+                p99 = percentile(s_rtts, 99)/1000
+                jitter_us = compute_jitter(win_rtts)/1000
+                loss_pct = win_errors/win_attempts*100 if win_attempts else 0
+
+                metrics_fh.write(f"{ts},{len(win_rtts)},{min_us:.2f},{max_us:.2f},"
+                                 f"{mean_us:.2f},{p50:.2f},{p95:.2f},{p99:.2f},"
+                                 f"{stddev_us:.2f},{jitter_us:.2f},{loss_pct:.2f}\n")
+
+                if baseline_p99 is None:
+                    baseline_samples.append(p99)
+                    if len(baseline_samples) >= args.baseline_windows:
+                        baseline_p99 = statistics.median(baseline_samples)
+                        log_event("INFO", f"Baseline p99 = {baseline_p99:.2f}µs")
+                else:
+                    if p99 > baseline_p99 * args.degradation_factor:
+                        log_event("WARNING",
+                                  f"DEGRADACIÓN p99={p99:.2f}µs "
+                                  f"({p99/baseline_p99:.1f}x baseline) "
+                                  f"max={max_us:.2f}µs jitter={jitter_us:.2f}µs")
+                    if max_us > args.spike_threshold_us:
+                        log_event("WARNING",
+                                  f"PICO max={max_us:.2f}µs "
+                                  f"(umbral={args.spike_threshold_us}µs)")
+                    if loss_pct > args.loss_threshold_pct:
+                        log_event("ERROR",
+                                  f"PÉRDIDA {loss_pct:.2f}% "
+                                  f"({win_errors}/{win_attempts})")
+
+            win_rtts = []
+            win_errors = 0
+            win_attempts = 0
+            win_start = time.monotonic()
+
+        if args.interval > 0:
+            time.sleep(args.interval)
+
+    if sock:
+        try: sock.close()
+        except: pass
+    if metrics_fh:
+        metrics_fh.close()
+    logger.info("Detenido")
+
+def setup_logger(log_dir, name):
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    h = RotatingFileHandler(Path(log_dir)/f"{name}.log",
+                            maxBytes=10*1024*1024, backupCount=5)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(h)
+    return logger
+
+def main():
+    p = argparse.ArgumentParser(description="netmon-latency: monitor TCP de latencia")
+    p.add_argument("--host", required=True)
+    p.add_argument("--port", type=int, default=9999)
+    p.add_argument("--interval", type=float, default=0.1)
+    p.add_argument("--window", type=int, default=10)
+    p.add_argument("--payload-size", type=int, default=64)
+    p.add_argument("--timeout", type=float, default=5.0)
+    p.add_argument("--reconnect-delay", type=float, default=5.0)
+    p.add_argument("--log-dir", default="/var/log/netmon/latency")
+    p.add_argument("--baseline-windows", type=int, default=30)
+    p.add_argument("--degradation-factor", type=float, default=2.0)
+    p.add_argument("--spike-threshold-us", type=float, default=100000)
+    p.add_argument("--loss-threshold-pct", type=float, default=1.0)
+    args = p.parse_args()
+
+    logger = setup_logger(args.log_dir, "latency")
+    try:
+        run(args, logger)
+    except Exception as e:
+        logger.exception(f"Fatal: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

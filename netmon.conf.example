@@ -1,0 +1,50 @@
+# Configuración de la suite netmon
+# Archivo: /etc/netmon/netmon.conf
+# Formato: variables shell estilo KEY=value (sin espacios alrededor del =)
+
+# ==================== CONFIGURACIÓN REQUERIDA ====================
+
+# IP del servidor netmon-server en el datacenter REMOTO (el otro lado).
+# Si este es el servidor B (donde corre netmon-server), puede dejarse vacío.
+REMOTE_HOST=10.0.0.5
+
+# Puerto donde corre netmon-server (TCP y UDP en el mismo puerto)
+REMOTE_PORT=9999
+
+
+# ==================== MONITOR DE LATENCIA (TCP) ==================
+
+# Segundos entre cada ping (0.1 = 10 pings/seg)
+LATENCY_INTERVAL=0.1
+
+# Segundos por ventana de agregación
+LATENCY_WINDOW=10
+
+
+# =============== MONITOR DE MICROCORTES (UDP) ====================
+
+# Pings por segundo. 1000 = resolución de 1ms.
+# Aumentar a 5000 o 10000 para sub-milisegundo (más CPU/banda).
+MICROCUTS_RATE=1000
+
+# Ventana de agregación en segundos
+MICROCUTS_WINDOW=10
+
+# Paquetes consecutivos perdidos para considerar "microdesconexión real".
+# Con rate=1000, threshold=2 = 2ms perdidos como mínimo.
+# Subir a 5 o 10 si solo te interesan cortes claros, sin ruido.
+MICROCUTS_BURST_THRESHOLD=2
+
+
+# =============== MONITOR DE CONEXIONES TCP =======================
+
+# Cuántas conexiones TCP paralelas mantener (1-16).
+# 4 es buen default: permite distinguir falla de red real (todas caen)
+# de ruido (solo 1 cae).
+CONNECTIONS_COUNT=4
+
+# Segundos entre heartbeats por conexión
+CONNECTIONS_HEARTBEAT_INTERVAL=5
+
+# Segundos a esperar respuesta antes de declarar "stall"
+CONNECTIONS_HEARTBEAT_TIMEOUT=10

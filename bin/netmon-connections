@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""
+netmon-connections: Monitor de conexiones TCP persistentes.
+
+Mantiene N conexiones simultáneas con un servidor remoto. Cuando una cae
+(reset, timeout, broken pipe, stall), registra timestamp, error y duración.
+Si TODAS caen al mismo tiempo → evento de red severo.
+
+Genera (en --log-dir):
+  disconnects-YYYY-MM-DD.log   Cada caída/reconexión con detalle
+  uptime-YYYY-MM-DD.csv        Resumen por hora
+  connections.log              Log operacional
+"""
+
+import argparse
+import socket
+import struct
+import time
+import threading
+import signal
+import logging
+import errno
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
+from collections import defaultdict
+
+RUNNING = True
+CONNECTIONS = {}
+STATS_LOCK = threading.Lock()
+HOURLY_STATS = defaultdict(lambda: {
+    "disconnects": 0, "stalls": 0, "total_uptime_s": 0,
+    "total_downtime_s": 0, "reconnects": 0, "longest_downtime_s": 0,
+})
+
+class ConnectionState:
+    def __init__(self, conn_id):
+        self.conn_id = conn_id
+        self.sock = None
+        self.connected_at = None
+        self.disconnected_at = None
+        self.last_heartbeat_ok = None
+
+def hour_key(ts=None):
+    if ts is None:
+        ts = datetime.now(timezone.utc)
+    return ts.strftime("%Y-%m-%d %H:00")
+
+def record_disconnect(state, error_type, error_msg, was_stall, log_dir, logger):
+    now_mono = time.monotonic()
+    now_utc = datetime.now(timezone.utc)
+    duration_s = (now_mono - state.connected_at) if state.connected_at else 0
+    state.disconnected_at = now_mono
+
+    today = now_utc.strftime("%Y-%m-%d")
+    ts = now_utc.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    line = (f"{ts}\tconn={state.conn_id}\t"
+            f"type={'STALL' if was_stall else 'DISCONNECT'}\t"
+            f"error={error_type}\tmsg={error_msg}\t"
+            f"uptime_before_s={duration_s:.2f}\n")
+    with open(log_dir / f"disconnects-{today}.log", "a") as f:
+        f.write(line)
+    logger.warning(f"[conn-{state.conn_id}] "
+                   f"{'STALL' if was_stall else 'DISCONNECT'} "
+                   f"({error_type}): {error_msg} | uptime: {duration_s:.2f}s")
+
+    with STATS_LOCK:
+        h = hour_key(now_utc)
+        if was_stall:
+            HOURLY_STATS[h]["stalls"] += 1
+        else:
+            HOURLY_STATS[h]["disconnects"] += 1
+        HOURLY_STATS[h]["total_uptime_s"] += duration_s
+
+def record_reconnect(state, downtime_s, log_dir, logger):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    with open(log_dir / f"disconnects-{today}.log", "a") as f:
+        f.write(f"{ts}\tconn={state.conn_id}\ttype=RECONNECT\t"
+                f"downtime_s={downtime_s:.2f}\n")
+    logger.info(f"[conn-{state.conn_id}] RECONECTADO tras {downtime_s:.2f}s")
+    with STATS_LOCK:
+        h = hour_key()
+        HOURLY_STATS[h]["reconnects"] += 1
+        HOURLY_STATS[h]["total_downtime_s"] += downtime_s
+        if downtime_s > HOURLY_STATS[h]["longest_downtime_s"]:
+            HOURLY_STATS[h]["longest_downtime_s"] = downtime_s
+
+def connect_socket(host, port, connect_timeout):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    if hasattr(socket, "TCP_USER_TIMEOUT"):
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, 15000)
+    s.settimeout(connect_timeout)
+    s.connect((host, port))
+    return s
+
+def connection_worker(state, args, log_dir, logger):
+    backoff = 1.0
+    payload = struct.pack("!Q", 0) + b"\x00" * 56
+    while RUNNING:
+        try:
+            sock = connect_socket(args.host, args.port, args.connect_timeout)
+            state.sock = sock
+            state.connected_at = time.monotonic()
+            if state.disconnected_at is not None:
+                downtime = state.connected_at - state.disconnected_at
+                record_reconnect(state, downtime, log_dir, logger)
+                state.disconnected_at = None
+            else:
+                logger.info(f"[conn-{state.conn_id}] conectado")
+            backoff = 1.0
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            if state.disconnected_at is None:
+                state.disconnected_at = time.monotonic()
+                record_disconnect(state, type(e).__name__, str(e), False, log_dir, logger)
+            time.sleep(min(backoff, args.max_backoff))
+            backoff *= 2
+            continue
+
+        try:
+            sock.settimeout(args.heartbeat_timeout)
+            while RUNNING:
+                t_send = time.monotonic()
+                try:
+                    sock.sendall(payload)
+                    remaining = len(payload)
+                    while remaining > 0:
+                        chunk = sock.recv(remaining)
+                        if not chunk:
+                            raise ConnectionError("peer cerró (recv vacío)")
+                        remaining -= len(chunk)
+                    state.last_heartbeat_ok = time.monotonic()
+                except socket.timeout:
+                    raise TimeoutError(f"heartbeat no respondió en "
+                                       f"{args.heartbeat_timeout}s")
+                elapsed = time.monotonic() - t_send
+                sleep_for = args.heartbeat_interval - elapsed
+                if sleep_for > 0:
+                    end = time.monotonic() + sleep_for
+                    while RUNNING and time.monotonic() < end:
+                        time.sleep(min(0.5, end - time.monotonic()))
+        except TimeoutError as e:
+            record_disconnect(state, "TimeoutError", str(e), True, log_dir, logger)
+        except (ConnectionError, BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError) as e:
+            record_disconnect(state, type(e).__name__, str(e), False, log_dir, logger)
+        except OSError as e:
+            err_name = errno.errorcode.get(e.errno, "OSError")
+            record_disconnect(state, err_name, str(e), False, log_dir, logger)
+        except Exception as e:
+            record_disconnect(state, type(e).__name__, str(e), False, log_dir, logger)
+        finally:
+            try: sock.close()
+            except: pass
+            state.sock = None
+
+def stats_aggregator(log_dir, logger, num_conns):
+    current_date = None
+    csv_fh = None
+
+    def open_csv():
+        nonlocal csv_fh, current_date
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != current_date:
+            if csv_fh: csv_fh.close()
+            current_date = today
+            path = log_dir / f"uptime-{today}.csv"
+            new = not path.exists()
+            csv_fh = open(path, "a", buffering=1)
+            if new:
+                csv_fh.write("hour_utc,disconnects,stalls,reconnects,"
+                             "total_downtime_s,longest_downtime_s,connections\n")
+
+    open_csv()
+    while RUNNING:
+        for _ in range(120):
+            if not RUNNING: return
+            time.sleep(0.5)
+        open_csv()
+        current_h = hour_key()
+        with STATS_LOCK:
+            hours_to_write = [h for h in HOURLY_STATS.keys() if h < current_h]
+            for h in hours_to_write:
+                s = HOURLY_STATS.pop(h)
+                csv_fh.write(f"{h},{s['disconnects']},{s['stalls']},"
+                             f"{s['reconnects']},{s['total_downtime_s']:.2f},"
+                             f"{s['longest_downtime_s']:.2f},{num_conns}\n")
+    if csv_fh:
+        csv_fh.close()
+
+def setup_logger(log_dir, name):
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    h = RotatingFileHandler(Path(log_dir)/f"{name}.log",
+                            maxBytes=10*1024*1024, backupCount=5)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(h)
+    return logger
+
+def shutdown(signum, frame):
+    global RUNNING
+    RUNNING = False
+
+def main():
+    p = argparse.ArgumentParser(description="netmon-connections: monitor de conexiones TCP")
+    p.add_argument("--host", required=True)
+    p.add_argument("--port", type=int, default=9999)
+    p.add_argument("--connections", type=int, default=4)
+    p.add_argument("--heartbeat-interval", type=float, default=5.0)
+    p.add_argument("--heartbeat-timeout", type=float, default=10.0)
+    p.add_argument("--connect-timeout", type=float, default=10.0)
+    p.add_argument("--max-backoff", type=float, default=30.0)
+    p.add_argument("--log-dir", default="/var/log/netmon/connections")
+    args = p.parse_args()
+
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(args.log_dir, "connections")
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    logger.info(f"Iniciado | dest={args.host}:{args.port} | "
+                f"conns={args.connections} | heartbeat={args.heartbeat_interval}s")
+
+    threads = []
+    for i in range(args.connections):
+        state = ConnectionState(conn_id=i)
+        CONNECTIONS[i] = state
+        t = threading.Thread(target=connection_worker,
+                             args=(state, args, log_dir, logger),
+                             daemon=True, name=f"conn-{i}")
+        t.start()
+        threads.append(t)
+
+    threading.Thread(target=stats_aggregator,
+                     args=(log_dir, logger, args.connections),
+                     daemon=True, name="agg").start()
+
+    while RUNNING:
+        time.sleep(1)
+
+    logger.info("Cerrando conexiones...")
+    for state in CONNECTIONS.values():
+        if state.sock:
+            try:
+                state.sock.shutdown(socket.SHUT_RDWR)
+                state.sock.close()
+            except: pass
+    for t in threads:
+        t.join(timeout=2)
+
+    with STATS_LOCK:
+        if HOURLY_STATS:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            with open(log_dir / f"uptime-{today}.csv", "a") as f:
+                for h, s in HOURLY_STATS.items():
+                    f.write(f"{h},{s['disconnects']},{s['stalls']},"
+                            f"{s['reconnects']},{s['total_downtime_s']:.2f},"
+                            f"{s['longest_downtime_s']:.2f},{args.connections}\n")
+    logger.info("Detenido")
+
+if __name__ == "__main__":
+    main()
