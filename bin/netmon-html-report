@@ -1,0 +1,1510 @@
+#!/usr/bin/env python3
+"""
+netmon-html-report: Genera un reporte HTML autocontenido con gráficos
+interactivos y todas las horas convertidas a Colombia (UTC-4).
+
+USO:
+    netmon-html-report --day 2026-05-14
+    netmon-html-report --day 2026-05-14 --output /tmp/reporte.html
+    netmon-html-report --day 2026-05-14 --base-dir /var/log/netmon
+"""
+
+import argparse
+import csv
+import json
+import sys
+import os
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+import html
+
+# Zona horaria Colombia (UTC-4)
+COLOMBIA_OFFSET = timedelta(hours=-4)
+COLOMBIA_TZ = timezone(COLOMBIA_OFFSET, "Colombia")
+
+
+def parse_ts(s):
+    """Parse ISO timestamp UTC y devuelve datetime con tz."""
+    s = s.rstrip("Z")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        dt = datetime.strptime(s.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def to_local(dt):
+    """Convierte datetime UTC a hora Colombia."""
+    return dt.astimezone(COLOMBIA_TZ)
+
+
+def fmt_local(dt, fmt="%Y-%m-%d %H:%M:%S"):
+    return to_local(dt).strftime(fmt)
+
+
+def load_latency_csv(path):
+    rows = []
+    if not Path(path).exists():
+        return rows
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            try:
+                r["timestamp"] = parse_ts(r["timestamp_utc"])
+                for k in ["min_us","max_us","mean_us","p50_us","p95_us",
+                         "p99_us","stddev_us","jitter_us","loss_pct"]:
+                    r[k] = float(r[k])
+                r["samples"] = int(r["samples"])
+                rows.append(r)
+            except (KeyError, ValueError):
+                continue
+    return rows
+
+
+def load_udp_csv(path):
+    rows = []
+    if not Path(path).exists():
+        return rows
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            try:
+                r["timestamp"] = parse_ts(r["timestamp_utc"])
+                for k in ["loss_pct","min_us","p50_us","p95_us","p99_us",
+                         "max_us","jitter_us","longest_cut_ms"]:
+                    r[k] = float(r[k])
+                for k in ["sent","received","lost","out_of_order","microcuts"]:
+                    r[k] = int(r[k])
+                rows.append(r)
+            except (KeyError, ValueError):
+                continue
+    return rows
+
+
+def load_microcuts_log(path):
+    events = []
+    if not Path(path).exists():
+        return events
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            ev = {"timestamp": parse_ts(parts[0])}
+            for p in parts[1:]:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    ev[k] = v
+            try:
+                ev["duration_ms"] = float(ev.get("duration_ms", 0))
+                ev["lost"] = int(ev.get("lost", 0))
+            except ValueError:
+                continue
+            events.append(ev)
+    return events
+
+
+def load_events(path):
+    events = []
+    if not Path(path).exists():
+        return events
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 2)
+            if len(parts) < 3:
+                continue
+            try:
+                events.append({
+                    "timestamp": parse_ts(parts[0]),
+                    "level": parts[1],
+                    "msg": parts[2],
+                })
+            except ValueError:
+                continue
+    return events
+
+
+def load_disconnects(path):
+    events = []
+    if not Path(path).exists():
+        return events
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            ev = {"timestamp": parse_ts(parts[0])}
+            for p in parts[1:]:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    ev[k] = v
+            events.append(ev)
+    return events
+
+
+def percentile(sd, p):
+    if not sd:
+        return 0
+    sd = sorted(sd)
+    k = (len(sd)-1)*(p/100.0)
+    f = int(k); c = min(f+1, len(sd)-1)
+    if f == c: return sd[f]
+    return sd[f] + (sd[c]-sd[f])*(k-f)
+
+
+def build_data(base_dir, day):
+    base = Path(base_dir)
+    lat = load_latency_csv(base / "latency" / f"metrics-{day}.csv")
+    udp = load_udp_csv(base / "microcuts" / f"metrics-{day}.csv")
+    cuts = load_microcuts_log(base / "microcuts" / f"microcuts-{day}.log")
+    lat_events = load_events(base / "latency" / f"events-{day}.log")
+    udp_events = load_events(base / "microcuts" / f"events-{day}.log")
+    discs = load_disconnects(base / "connections" / f"disconnects-{day}.log")
+
+    return {
+        "latency": lat,
+        "udp": udp,
+        "microcuts": cuts,
+        "latency_events": lat_events,
+        "udp_events": udp_events,
+        "disconnects": discs,
+    }
+
+
+def compute_summary(data):
+    lat = data["latency"]
+    udp = data["udp"]
+    cuts = data["microcuts"]
+    discs = data["disconnects"]
+
+    summary = {
+        "ventanas_lat": len(lat),
+        "ventanas_udp": len(udp),
+        "total_microcuts": len(cuts),
+        "total_disconnects": len([d for d in discs if d.get("type") == "DISCONNECT"]),
+        "total_stalls": len([d for d in discs if d.get("type") == "STALL"]),
+        "total_reconnects": len([d for d in discs if d.get("type") == "RECONNECT"]),
+    }
+
+    if lat:
+        p50s = [r["p50_us"] for r in lat]
+        p99s = [r["p99_us"] for r in lat]
+        maxs = [r["max_us"] for r in lat]
+        mins = [r["min_us"] for r in lat]
+        summary["lat_p50_median"] = percentile(p50s, 50) / 1000  # ms
+        summary["lat_p99_median"] = percentile(p99s, 50) / 1000
+        summary["lat_p99_worst"] = max(p99s) / 1000
+        summary["lat_max_worst"] = max(maxs) / 1000
+        summary["lat_min_abs"] = min(mins) / 1000
+        summary["lat_max_abs"] = max(maxs) / 1000
+
+    if udp:
+        total_sent = sum(r["sent"] for r in udp)
+        total_lost = sum(r["lost"] for r in udp)
+        summary["udp_sent"] = total_sent
+        summary["udp_lost"] = total_lost
+        summary["udp_loss_pct"] = (total_lost / total_sent * 100) if total_sent else 0
+
+    if cuts:
+        durations = [c["duration_ms"] for c in cuts]
+        summary["cut_longest_ms"] = max(durations)
+        summary["cut_dist"] = {
+            "<5ms": sum(1 for d in durations if d < 5),
+            "5-10ms": sum(1 for d in durations if 5 <= d < 10),
+            "10-50ms": sum(1 for d in durations if 10 <= d < 50),
+            "50-100ms": sum(1 for d in durations if 50 <= d < 100),
+            "100-500ms": sum(1 for d in durations if 100 <= d < 500),
+            ">=500ms": sum(1 for d in durations if d >= 500),
+        }
+
+    return summary
+
+
+def build_hourly_stats(data):
+    """Estadísticas por hora en hora Colombia."""
+    by_hour = defaultdict(lambda: {
+        "lat_p99": [], "lat_max": [], "microcuts": 0,
+        "cut_longest": 0, "disconnects": 0,
+    })
+    for r in data["latency"]:
+        h = to_local(r["timestamp"]).strftime("%H:00")
+        by_hour[h]["lat_p99"].append(r["p99_us"])
+        by_hour[h]["lat_max"].append(r["max_us"])
+    for c in data["microcuts"]:
+        h = to_local(c["timestamp"]).strftime("%H:00")
+        by_hour[h]["microcuts"] += 1
+        if c["duration_ms"] > by_hour[h]["cut_longest"]:
+            by_hour[h]["cut_longest"] = c["duration_ms"]
+    for d in data["disconnects"]:
+        if d.get("type") in ("DISCONNECT", "STALL"):
+            h = to_local(d["timestamp"]).strftime("%H:00")
+            by_hour[h]["disconnects"] += 1
+
+    result = {}
+    for h, v in by_hour.items():
+        result[h] = {
+            "p99_median_ms": percentile(v["lat_p99"], 50)/1000 if v["lat_p99"] else 0,
+            "max_ms": max(v["lat_max"])/1000 if v["lat_max"] else 0,
+            "microcuts": v["microcuts"],
+            "cut_longest_ms": v["cut_longest"],
+            "disconnects": v["disconnects"],
+        }
+    return result
+
+
+def detect_critical_events(data, threshold_ms=100):
+    """Eventos críticos: microcortes >= threshold ms o disconnects."""
+    critical = []
+    for c in data["microcuts"]:
+        if c["duration_ms"] >= threshold_ms:
+            critical.append({
+                "ts": c["timestamp"],
+                "kind": "microcut",
+                "severity": "high" if c["duration_ms"] >= 500 else "medium",
+                "detail": f"Microcorte de {c['duration_ms']:.0f} ms ({c['lost']} paquetes UDP perdidos)",
+                "duration_ms": c["duration_ms"],
+            })
+    for d in data["disconnects"]:
+        if d.get("type") == "DISCONNECT":
+            critical.append({
+                "ts": d["timestamp"],
+                "kind": "disconnect",
+                "severity": "high",
+                "detail": f"Caída TCP en conn={d.get('conn','?')} ({d.get('error','?')})",
+                "duration_ms": 0,
+            })
+        elif d.get("type") == "STALL":
+            critical.append({
+                "ts": d["timestamp"],
+                "kind": "stall",
+                "severity": "medium",
+                "detail": f"Stall TCP en conn={d.get('conn','?')}",
+                "duration_ms": 0,
+            })
+    critical.sort(key=lambda x: x["ts"])
+    return critical
+
+
+# ----------------------------- HTML Generation -----------------------------
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reporte Netmon · __DAY__ (Hora Colombia)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,600;9..144,800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #0a0e1a;
+  --bg-2: #11172a;
+  --bg-3: #1a2238;
+  --border: #2a3553;
+  --text: #e8edf7;
+  --text-dim: #8a94b0;
+  --text-dimmer: #4a5577;
+  --accent: #ff6b35;
+  --accent-2: #ffb84d;
+  --green: #4ade80;
+  --yellow: #fbbf24;
+  --red: #ef4444;
+  --blue: #60a5fa;
+  --purple: #a78bfa;
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --serif: 'Fraunces', Georgia, serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.6;
+  min-height: 100vh;
+  font-feature-settings: "ss01", "cv01", "cv02";
+}
+
+body {
+  background:
+    radial-gradient(ellipse at top left, rgba(255, 107, 53, 0.08), transparent 50%),
+    radial-gradient(ellipse at bottom right, rgba(96, 165, 250, 0.06), transparent 50%),
+    var(--bg);
+  background-attachment: fixed;
+}
+
+.container {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 3rem 2rem;
+}
+
+/* ===== HEADER ===== */
+header {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 2rem;
+  margin-bottom: 3rem;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2rem;
+  align-items: end;
+}
+
+.logo {
+  font-family: var(--serif);
+  font-size: clamp(2.5rem, 6vw, 4.5rem);
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  line-height: 0.95;
+  color: var(--text);
+}
+
+.logo .accent {
+  color: var(--accent);
+  font-style: italic;
+}
+
+.subtitle {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  margin-top: 0.75rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.meta {
+  text-align: right;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  letter-spacing: 0.05em;
+}
+
+.meta .label {
+  color: var(--text-dimmer);
+  text-transform: uppercase;
+  font-size: 0.65rem;
+}
+
+.meta .value {
+  color: var(--text);
+  font-weight: 500;
+  margin-bottom: 0.5rem;
+}
+
+/* ===== SECTIONS ===== */
+section {
+  margin-bottom: 4rem;
+}
+
+h2 {
+  font-family: var(--serif);
+  font-size: 2rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+h2 .num {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+h2 .accent-bar {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--accent), transparent);
+  align-self: center;
+  margin-left: 1rem;
+}
+
+.section-intro {
+  color: var(--text-dim);
+  margin-bottom: 2rem;
+  max-width: 65ch;
+  font-size: 0.9rem;
+}
+
+/* ===== KPI GRID ===== */
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.kpi {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  padding: 1.5rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.kpi::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0;
+  height: 2px;
+  width: 100%;
+  background: var(--border);
+}
+
+.kpi.green::before { background: var(--green); }
+.kpi.yellow::before { background: var(--yellow); }
+.kpi.red::before { background: var(--red); }
+.kpi.blue::before { background: var(--blue); }
+.kpi.accent::before { background: var(--accent); }
+
+.kpi .label {
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-size: 0.65rem;
+  letter-spacing: 0.1em;
+  margin-bottom: 0.75rem;
+}
+
+.kpi .value {
+  font-family: var(--serif);
+  font-size: 2.25rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  margin-bottom: 0.25rem;
+}
+
+.kpi .unit {
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  margin-left: 0.25rem;
+}
+
+.kpi .note {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.kpi .badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 2px;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-top: 0.5rem;
+}
+
+.kpi .badge.ok { background: rgba(74, 222, 128, 0.15); color: var(--green); }
+.kpi .badge.warn { background: rgba(251, 191, 36, 0.15); color: var(--yellow); }
+.kpi .badge.bad { background: rgba(239, 68, 68, 0.15); color: var(--red); }
+
+/* ===== CHART CONTAINER ===== */
+.chart-box {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.chart-title {
+  font-family: var(--serif);
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+.chart-desc {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  margin-bottom: 1.5rem;
+  max-width: 65ch;
+}
+
+.chart-canvas-wrap {
+  position: relative;
+  height: 320px;
+}
+
+.chart-canvas-wrap.tall {
+  height: 420px;
+}
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+}
+
+@media (max-width: 900px) {
+  .chart-grid { grid-template-columns: 1fr; }
+}
+
+/* ===== EVENTS TABLE ===== */
+.events-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.events-table th {
+  text-align: left;
+  padding: 0.75rem 1rem;
+  background: var(--bg-3);
+  color: var(--text-dim);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  border-bottom: 1px solid var(--border);
+}
+
+.events-table td {
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.events-table tr:hover { background: rgba(255, 255, 255, 0.02); }
+
+.severity-pill {
+  display: inline-block;
+  padding: 0.2rem 0.6rem;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.severity-pill.high { background: rgba(239, 68, 68, 0.15); color: var(--red); }
+.severity-pill.medium { background: rgba(251, 191, 36, 0.15); color: var(--yellow); }
+.severity-pill.low { background: rgba(96, 165, 250, 0.15); color: var(--blue); }
+
+.kind-tag {
+  font-family: var(--mono);
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+
+/* ===== INFO BOX ===== */
+.info-box {
+  background: linear-gradient(135deg, rgba(255, 107, 53, 0.06), rgba(96, 165, 250, 0.04));
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  padding: 1.5rem;
+  margin: 2rem 0;
+}
+
+.info-box.green { border-left-color: var(--green); }
+.info-box.yellow { border-left-color: var(--yellow); }
+.info-box.red { border-left-color: var(--red); }
+.info-box.blue { border-left-color: var(--blue); }
+
+.info-box h3 {
+  font-family: var(--serif);
+  font-size: 1.1rem;
+  margin-bottom: 0.75rem;
+  font-weight: 600;
+}
+
+.info-box p {
+  color: var(--text-dim);
+  margin-bottom: 0.5rem;
+}
+
+.info-box code {
+  background: var(--bg-3);
+  padding: 0.1rem 0.4rem;
+  border-radius: 2px;
+  font-size: 0.85em;
+  color: var(--accent-2);
+}
+
+.info-box ul {
+  margin-left: 1.25rem;
+  margin-top: 0.5rem;
+  color: var(--text-dim);
+}
+
+.info-box li { margin-bottom: 0.4rem; }
+
+/* ===== HOURLY HEATMAP ===== */
+.heatmap {
+  display: grid;
+  grid-template-columns: repeat(24, 1fr);
+  gap: 3px;
+  margin: 1rem 0;
+}
+
+.hm-cell {
+  aspect-ratio: 1;
+  background: var(--bg-3);
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.6rem;
+  color: var(--text-dimmer);
+  cursor: default;
+  position: relative;
+  transition: transform 0.15s;
+}
+
+.hm-cell:hover {
+  transform: scale(1.2);
+  z-index: 5;
+}
+
+.hm-cell .tooltip {
+  position: absolute;
+  bottom: 110%;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 0.4rem 0.7rem;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 10;
+  color: var(--text);
+}
+
+.hm-cell:hover .tooltip { opacity: 1; }
+
+.hm-cell.l0 { background: var(--bg-3); }
+.hm-cell.l1 { background: rgba(74, 222, 128, 0.3); color: var(--text); }
+.hm-cell.l2 { background: rgba(251, 191, 36, 0.3); color: var(--text); }
+.hm-cell.l3 { background: rgba(255, 107, 53, 0.4); color: var(--text); }
+.hm-cell.l4 { background: rgba(239, 68, 68, 0.5); color: var(--text); font-weight: 600; }
+
+.heatmap-legend {
+  display: flex;
+  gap: 1rem;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+
+.heatmap-legend .swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 0.4rem;
+  vertical-align: middle;
+  border-radius: 2px;
+}
+
+/* ===== FOOTER ===== */
+footer {
+  margin-top: 5rem;
+  padding-top: 2rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-dimmer);
+  font-size: 0.75rem;
+  text-align: center;
+}
+
+footer .accent { color: var(--accent); }
+
+/* ===== ANIMATIONS ===== */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+section { animation: fadeIn 0.6s ease-out backwards; }
+section:nth-child(2) { animation-delay: 0.05s; }
+section:nth-child(3) { animation-delay: 0.1s; }
+section:nth-child(4) { animation-delay: 0.15s; }
+section:nth-child(5) { animation-delay: 0.2s; }
+section:nth-child(6) { animation-delay: 0.25s; }
+section:nth-child(7) { animation-delay: 0.3s; }
+
+/* ===== PRINT ===== */
+@media print {
+  body { background: white; color: black; }
+  .chart-box, .kpi, .info-box { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <div>
+    <div class="logo">net<span class="accent">/</span>mon<span class="accent">.</span></div>
+    <div class="subtitle">REPORTE DIARIO · ENLACE INTER-DATACENTER</div>
+  </div>
+  <div class="meta">
+    <div class="label">Fecha analizada</div>
+    <div class="value">__DAY_LOCAL__</div>
+    <div class="label">Zona horaria</div>
+    <div class="value">America/Bogota · UTC-4</div>
+    <div class="label">Generado</div>
+    <div class="value">__GENERATED__</div>
+  </div>
+</header>
+
+<!-- ============ SECCION 1: RESUMEN EJECUTIVO ============ -->
+<section>
+  <h2><span class="num">01</span>Resumen Ejecutivo<span class="accent-bar"></span></h2>
+  <p class="section-intro">
+    Snapshot de salud del enlace de red durante __DAY_LOCAL__. Las métricas se agregan en ventanas de 10 segundos. Todas las horas mostradas en este reporte están en hora Colombia (UTC-4).
+  </p>
+
+  <div class="kpi-grid">
+    __KPI_CARDS__
+  </div>
+
+  __EXECUTIVE_SUMMARY__
+</section>
+
+<!-- ============ SECCION 2: LATENCIA ============ -->
+<section>
+  <h2><span class="num">02</span>Latencia TCP a lo largo del día<span class="accent-bar"></span></h2>
+  <p class="section-intro">
+    RTT (Round-Trip Time) medido con conexión TCP persistente, 10 muestras por segundo. La línea muestra el p50 (mediana) y la zona sombreada el rango entre min y p99. Picos extremos (max) destacados en rojo.
+  </p>
+
+  <div class="chart-box">
+    <div class="chart-title">Evolución temporal de latencia</div>
+    <div class="chart-desc">
+      <strong>Cómo leer:</strong> la línea naranja es el RTT típico. La zona sombreada muestra la dispersión. Los puntos rojos en la parte superior son picos catastróficos (max > umbral). Si la línea naranja se mantiene plana, la red está estable; si tiene "escalones", hubo cambios de ruta.
+    </div>
+    <div class="chart-canvas-wrap tall">
+      <canvas id="latencyChart"></canvas>
+    </div>
+  </div>
+
+  <div class="info-box blue">
+    <h3>¿Qué significan p50, p95, p99 y max?</h3>
+    <p><strong>p50</strong> (mediana): RTT típico. Es la latencia que experimenta la mitad del tráfico.</p>
+    <p><strong>p95</strong>: el 95% del tráfico tiene RTT menor a este valor. El 5% peor lo supera.</p>
+    <p><strong>p99</strong>: solo el 1% peor de las muestras lo supera. Crítico para aplicaciones sensibles.</p>
+    <p><strong>max</strong>: el peor RTT registrado. Indica picos puntuales y problemas momentáneos.</p>
+    <p><strong>jitter</strong>: la variación entre muestras consecutivas. Bajo jitter = red predecible.</p>
+  </div>
+</section>
+
+<!-- ============ SECCION 3: PERDIDA UDP ============ -->
+<section>
+  <h2><span class="num">03</span>Análisis UDP y Microcortes<span class="accent-bar"></span></h2>
+  <p class="section-intro">
+    UDP detecta lo que TCP esconde. Con __UDP_RATE__ paquetes por segundo en resolución de 1 ms, podemos ver microcortes que TCP enmascara con retransmisiones. Cualquier ráfaga de paquetes UDP perdidos consecutivos = microdesconexión real.
+  </p>
+
+  <div class="chart-grid">
+    <div class="chart-box">
+      <div class="chart-title">Distribución de microcortes por duración</div>
+      <div class="chart-desc">
+        Microcortes &lt; 5 ms son ruido normal de WAN (ignorables). 100-500 ms ya son eventos de reroute o flap. ≥ 500 ms son incidentes serios.
+      </div>
+      <div class="chart-canvas-wrap">
+        <canvas id="cutsDistChart"></canvas>
+      </div>
+    </div>
+
+    <div class="chart-box">
+      <div class="chart-title">Microcortes por hora del día (Colombia)</div>
+      <div class="chart-desc">
+        Concentración temporal. Picos a la misma hora cada día sugieren un proceso programado (backup, replicación, mantenimiento).
+      </div>
+      <div class="chart-canvas-wrap">
+        <canvas id="cutsByHourChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="chart-box">
+    <div class="chart-title">Línea temporal de microcortes individuales</div>
+    <div class="chart-desc">
+      Cada punto es un microcorte detectado. Eje Y = duración en ms (escala logarítmica). Los puntos sobre la línea roja (100 ms) son los que importan.
+    </div>
+    <div class="chart-canvas-wrap">
+      <canvas id="cutsTimelineChart"></canvas>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SECCION 4: HEATMAP HORARIO ============ -->
+<section>
+  <h2><span class="num">04</span>Heatmap por hora<span class="accent-bar"></span></h2>
+  <p class="section-intro">
+    Visión global de la jornada en hora Colombia. La intensidad del color indica el nivel de incidencia: verde = sano, amarillo = degradado leve, naranja = degradado, rojo = incidente serio.
+  </p>
+
+  <div class="chart-box">
+    <div class="chart-title">Incidencia por hora (Colombia)</div>
+    <div class="chart-desc">Pasa el cursor por encima para ver el detalle.</div>
+    <div class="heatmap">
+      __HEATMAP__
+    </div>
+    <div class="heatmap-legend">
+      <span><span class="swatch" style="background: var(--bg-3);"></span>Sin actividad</span>
+      <span><span class="swatch" style="background: rgba(74, 222, 128, 0.3);"></span>Sano (0 microcortes)</span>
+      <span><span class="swatch" style="background: rgba(251, 191, 36, 0.3);"></span>Leve (1-3)</span>
+      <span><span class="swatch" style="background: rgba(255, 107, 53, 0.4);"></span>Moderado (4-10)</span>
+      <span><span class="swatch" style="background: rgba(239, 68, 68, 0.5);"></span>Severo (&gt;10)</span>
+    </div>
+  </div>
+
+  <div class="chart-box">
+    <div class="chart-title">Tabla horaria detallada</div>
+    <table class="events-table">
+      <thead>
+        <tr>
+          <th>Hora Colombia</th>
+          <th>Hora UTC</th>
+          <th style="text-align:right">p99 latencia</th>
+          <th style="text-align:right">Max</th>
+          <th style="text-align:right">Microcortes</th>
+          <th style="text-align:right">Cut más largo</th>
+          <th style="text-align:right">Disconnects</th>
+        </tr>
+      </thead>
+      <tbody>
+        __HOURLY_TABLE__
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ SECCION 5: EVENTOS CRITICOS ============ -->
+<section>
+  <h2><span class="num">05</span>Eventos Críticos del Día<span class="accent-bar"></span></h2>
+  <p class="section-intro">
+    Sólo eventos significativos: microcortes ≥ 100 ms, caídas TCP y stalls. Todo lo de menor magnitud se considera ruido normal de red WAN.
+  </p>
+
+  __CRITICAL_EVENTS__
+</section>
+
+<!-- ============ SECCION 6: INTERPRETACION ============ -->
+<section>
+  <h2><span class="num">06</span>Diagnóstico e Interpretación<span class="accent-bar"></span></h2>
+
+  __DIAGNOSIS__
+</section>
+
+<footer>
+  <div>net<span class="accent">/</span>mon · suite de monitoreo de red entre datacenters</div>
+  <div style="margin-top: 0.5rem">Reporte generado el __GENERATED__ · Datos: <code>/var/log/netmon</code></div>
+</footer>
+
+</div>
+
+<script>
+const CHART_DATA = __CHART_DATA__;
+
+// Tema consistente
+const themeColors = {
+  text: '#e8edf7',
+  textDim: '#8a94b0',
+  border: '#2a3553',
+  bg: '#11172a',
+  accent: '#ff6b35',
+  accent2: '#ffb84d',
+  green: '#4ade80',
+  yellow: '#fbbf24',
+  red: '#ef4444',
+  blue: '#60a5fa',
+  purple: '#a78bfa',
+};
+
+Chart.defaults.color = themeColors.textDim;
+Chart.defaults.borderColor = themeColors.border;
+Chart.defaults.font.family = "'JetBrains Mono', monospace";
+Chart.defaults.font.size = 11;
+
+// ============ 1. LATENCY CHART ============
+new Chart(document.getElementById('latencyChart'), {
+  type: 'line',
+  data: {
+    labels: CHART_DATA.latency.labels,
+    datasets: [
+      {
+        label: 'min',
+        data: CHART_DATA.latency.min,
+        borderColor: 'rgba(96, 165, 250, 0.3)',
+        backgroundColor: 'rgba(96, 165, 250, 0.05)',
+        borderWidth: 1,
+        pointRadius: 0,
+        fill: '+1',
+        tension: 0.2,
+      },
+      {
+        label: 'p50',
+        data: CHART_DATA.latency.p50,
+        borderColor: themeColors.accent,
+        backgroundColor: 'transparent',
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.2,
+      },
+      {
+        label: 'p99',
+        data: CHART_DATA.latency.p99,
+        borderColor: 'rgba(167, 139, 250, 0.5)',
+        borderWidth: 1,
+        pointRadius: 0,
+        tension: 0.2,
+      },
+      {
+        label: 'max (picos)',
+        data: CHART_DATA.latency.max,
+        borderColor: themeColors.red,
+        backgroundColor: 'transparent',
+        borderWidth: 0,
+        pointRadius: (ctx) => {
+          const v = ctx.parsed?.y;
+          if (v == null) return 0;
+          return v > 100 ? 3 : 0;
+        },
+        pointBackgroundColor: themeColors.red,
+        showLine: false,
+      },
+    ]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    scales: {
+      x: {
+        ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12 },
+        grid: { color: 'rgba(42, 53, 83, 0.3)' },
+      },
+      y: {
+        title: { display: true, text: 'Latencia (ms)' },
+        grid: { color: 'rgba(42, 53, 83, 0.3)' },
+        beginAtZero: false,
+      },
+    },
+    plugins: {
+      legend: { position: 'top', labels: { boxWidth: 12, padding: 12 } },
+      tooltip: {
+        backgroundColor: themeColors.bg,
+        borderColor: themeColors.border,
+        borderWidth: 1,
+        callbacks: {
+          label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)} ms`,
+        },
+      },
+    },
+  },
+});
+
+// ============ 2. CUTS DISTRIBUTION ============
+new Chart(document.getElementById('cutsDistChart'), {
+  type: 'bar',
+  data: {
+    labels: CHART_DATA.cutsDist.labels,
+    datasets: [{
+      data: CHART_DATA.cutsDist.values,
+      backgroundColor: CHART_DATA.cutsDist.colors,
+      borderWidth: 0,
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    indexAxis: 'y',
+    scales: {
+      x: { grid: { color: 'rgba(42, 53, 83, 0.3)' }, ticks: { precision: 0 } },
+      y: { grid: { display: false } },
+    },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: themeColors.bg,
+        borderColor: themeColors.border,
+        borderWidth: 1,
+      },
+    },
+  },
+});
+
+// ============ 3. CUTS BY HOUR ============
+new Chart(document.getElementById('cutsByHourChart'), {
+  type: 'bar',
+  data: {
+    labels: CHART_DATA.cutsByHour.labels,
+    datasets: [{
+      label: 'Microcortes',
+      data: CHART_DATA.cutsByHour.values,
+      backgroundColor: CHART_DATA.cutsByHour.colors,
+      borderWidth: 0,
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: { grid: { display: false }, ticks: { maxRotation: 0 } },
+      y: { grid: { color: 'rgba(42, 53, 83, 0.3)' }, ticks: { precision: 0 } },
+    },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: themeColors.bg,
+        borderColor: themeColors.border,
+        borderWidth: 1,
+      },
+    },
+  },
+});
+
+// ============ 4. CUTS TIMELINE ============
+new Chart(document.getElementById('cutsTimelineChart'), {
+  type: 'scatter',
+  data: {
+    datasets: [{
+      label: 'Microcortes',
+      data: CHART_DATA.cutsTimeline,
+      pointBackgroundColor: (ctx) => {
+        const v = ctx.parsed?.y;
+        if (v == null) return themeColors.green;
+        if (v >= 100) return themeColors.red;
+        if (v >= 50) return themeColors.accent;
+        if (v >= 10) return themeColors.yellow;
+        return themeColors.green;
+      },
+      pointBorderWidth: 0,
+      pointRadius: (ctx) => {
+        const v = ctx.parsed?.y;
+        if (v == null) return 3;
+        if (v >= 100) return 7;
+        if (v >= 50) return 5;
+        if (v >= 10) return 4;
+        return 3;
+      },
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: {
+        type: 'category',
+        labels: CHART_DATA.timeLabels,
+        grid: { color: 'rgba(42, 53, 83, 0.3)' },
+        ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12 },
+      },
+      y: {
+        type: 'logarithmic',
+        title: { display: true, text: 'Duración (ms) — escala log' },
+        grid: { color: 'rgba(42, 53, 83, 0.3)' },
+      },
+    },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: themeColors.bg,
+        borderColor: themeColors.border,
+        borderWidth: 1,
+        callbacks: {
+          title: (items) => CHART_DATA.timeLabels[items[0].parsed.x] || '',
+          label: (ctx) => `${ctx.parsed.y.toFixed(0)} ms`,
+        },
+      },
+      annotation: {},
+    },
+  },
+});
+</script>
+</body>
+</html>
+"""
+
+
+def render_html(data, day, base_dir, udp_rate=1000):
+    summary = compute_summary(data)
+    hourly = build_hourly_stats(data)
+    critical = detect_critical_events(data, threshold_ms=100)
+
+    # === KPI CARDS ===
+    kpi_html = []
+
+    if "lat_p50_median" in summary:
+        kpi_html.append(f'''
+          <div class="kpi accent">
+            <div class="label">Latencia mediana (p50)</div>
+            <div class="value">{summary["lat_p50_median"]:.1f}<span class="unit">ms</span></div>
+            <div class="note">RTT típico del enlace</div>
+          </div>
+        ''')
+        kpi_html.append(f'''
+          <div class="kpi blue">
+            <div class="label">p99 mediano</div>
+            <div class="value">{summary["lat_p99_median"]:.1f}<span class="unit">ms</span></div>
+            <div class="note">El 1% peor en una ventana típica</div>
+          </div>
+        ''')
+        kpi_html.append(f'''
+          <div class="kpi red">
+            <div class="label">Peor pico del día</div>
+            <div class="value">{summary["lat_max_worst"]:.1f}<span class="unit">ms</span></div>
+            <div class="note">Evento puntual más extremo</div>
+          </div>
+        ''')
+
+    if "udp_loss_pct" in summary:
+        loss = summary["udp_loss_pct"]
+        loss_class = "green" if loss < 0.01 else "yellow" if loss < 0.1 else "red"
+        loss_badge = "ok" if loss < 0.01 else "warn" if loss < 0.1 else "bad"
+        loss_text = "Excelente" if loss < 0.01 else "Aceptable" if loss < 0.1 else "Atención"
+        kpi_html.append(f'''
+          <div class="kpi {loss_class}">
+            <div class="label">Pérdida UDP global</div>
+            <div class="value">{loss:.4f}<span class="unit">%</span></div>
+            <span class="badge {loss_badge}">{loss_text}</span>
+          </div>
+        ''')
+        kpi_html.append(f'''
+          <div class="kpi blue">
+            <div class="label">Paquetes UDP procesados</div>
+            <div class="value">{summary["udp_sent"]/1_000_000:.1f}<span class="unit">M</span></div>
+            <div class="note">{summary["udp_sent"]:,} totales</div>
+          </div>
+        ''')
+
+    if summary["total_microcuts"] > 0:
+        cuts_class = "green" if summary["total_microcuts"] < 20 else "yellow" if summary["total_microcuts"] < 100 else "red"
+        kpi_html.append(f'''
+          <div class="kpi {cuts_class}">
+            <div class="label">Microcortes detectados</div>
+            <div class="value">{summary["total_microcuts"]}</div>
+            <div class="note">Más largo: {summary.get("cut_longest_ms", 0):.0f} ms</div>
+          </div>
+        ''')
+
+    disc_count = summary["total_disconnects"]
+    disc_class = "green" if disc_count == 0 else "red"
+    disc_badge = "ok" if disc_count == 0 else "bad"
+    disc_text = "Estable" if disc_count == 0 else "Inestable"
+    kpi_html.append(f'''
+      <div class="kpi {disc_class}">
+        <div class="label">Caídas de conexiones TCP</div>
+        <div class="value">{disc_count}</div>
+        <span class="badge {disc_badge}">{disc_text}</span>
+      </div>
+    ''')
+
+    # === EXECUTIVE SUMMARY ===
+    # Determinar veredicto global
+    if summary["total_disconnects"] == 0 and summary["total_microcuts"] < 20:
+        verdict_class = "green"
+        verdict_title = "✓ Enlace saludable"
+        verdict_body = "El enlace operó establemente durante todo el período. No se detectaron caídas TCP y la pérdida UDP es muy baja. Las aplicaciones productivas no debieron notar incidentes."
+    elif summary["total_disconnects"] == 0:
+        verdict_class = "yellow"
+        verdict_title = "⚠ Enlace estable con glitches UDP"
+        verdict_body = f"Las conexiones TCP no se cayeron en todo el período, lo cual es excelente. Sin embargo, se detectaron {summary['total_microcuts']} microcortes UDP, varios de los cuales podrían haber afectado aplicaciones de tiempo real (VoIP, video, streaming). Aplicaciones TCP tradicionales (web, BD, APIs) no fueron afectadas."
+    else:
+        verdict_class = "red"
+        verdict_title = "✗ Enlace con incidentes serios"
+        verdict_body = f"Se detectaron {summary['total_disconnects']} caídas de conexiones TCP, indicando problemas de red que afectaron aplicaciones productivas. Requiere investigación inmediata."
+
+    exec_summary = f'''
+      <div class="info-box {verdict_class}">
+        <h3>{verdict_title}</h3>
+        <p>{verdict_body}</p>
+      </div>
+    '''
+
+    # === HEATMAP ===
+    heatmap_cells = []
+    for h in range(24):
+        h_str = f"{h:02d}:00"
+        stats = hourly.get(h_str, {"microcuts": 0, "disconnects": 0,
+                                    "p99_median_ms": 0, "cut_longest_ms": 0, "max_ms": 0})
+        cuts = stats["microcuts"]
+        discs = stats["disconnects"]
+        # Determinar nivel
+        if discs > 0:
+            level = "l4"
+        elif cuts > 10:
+            level = "l4"
+        elif cuts > 3:
+            level = "l3"
+        elif cuts > 0:
+            level = "l2"
+        elif stats["p99_median_ms"] > 0:
+            level = "l1"
+        else:
+            level = "l0"
+        tooltip = (f"{h_str} Col.<br>"
+                   f"p99: {stats['p99_median_ms']:.0f}ms<br>"
+                   f"max: {stats['max_ms']:.0f}ms<br>"
+                   f"µcuts: {cuts} (peor: {stats['cut_longest_ms']:.0f}ms)<br>"
+                   f"discs: {discs}")
+        heatmap_cells.append(
+            f'<div class="hm-cell {level}">{h:02d}<div class="tooltip">{tooltip}</div></div>'
+        )
+    heatmap_html = "".join(heatmap_cells)
+
+    # === HOURLY TABLE ===
+    hourly_rows = []
+    for h in range(24):
+        h_str = f"{h:02d}:00"
+        if h_str not in hourly:
+            continue
+        stats = hourly[h_str]
+        # UTC equivalente
+        utc_hour = (h + 4) % 24
+        utc_str = f"{utc_hour:02d}:00"
+
+        # Color del p99
+        p99 = stats["p99_median_ms"]
+        max_v = stats["max_ms"]
+        cuts = stats["microcuts"]
+        discs = stats["disconnects"]
+
+        max_color = ""
+        if max_v > 200:
+            max_color = "color: var(--red); font-weight: 600"
+        elif max_v > 100:
+            max_color = "color: var(--yellow)"
+
+        cuts_color = ""
+        if cuts > 10:
+            cuts_color = "color: var(--red); font-weight: 600"
+        elif cuts > 3:
+            cuts_color = "color: var(--yellow)"
+
+        discs_color = "color: var(--red); font-weight: 600" if discs > 0 else "color: var(--text-dimmer)"
+
+        hourly_rows.append(f'''
+          <tr>
+            <td><strong>{h_str}</strong></td>
+            <td style="color: var(--text-dim)">{utc_str} UTC</td>
+            <td style="text-align:right">{p99:.1f} ms</td>
+            <td style="text-align:right; {max_color}">{max_v:.1f} ms</td>
+            <td style="text-align:right; {cuts_color}">{cuts}</td>
+            <td style="text-align:right">{stats["cut_longest_ms"]:.0f} ms</td>
+            <td style="text-align:right; {discs_color}">{discs}</td>
+          </tr>
+        ''')
+
+    # === CRITICAL EVENTS ===
+    if critical:
+        ev_rows = []
+        for ev in critical:
+            local = to_local(ev["ts"])
+            sev_class = ev["severity"]
+            kind_label = {"microcut": "MICROCORTE", "disconnect": "DESCONEXIÓN", "stall": "STALL"}.get(ev["kind"], ev["kind"].upper())
+            ev_rows.append(f'''
+              <tr>
+                <td><strong>{local.strftime("%H:%M:%S")}</strong> Col.<br>
+                    <span style="color: var(--text-dimmer); font-size: 0.75em">{ev["ts"].strftime("%H:%M:%S")} UTC</span></td>
+                <td><span class="kind-tag">{kind_label}</span></td>
+                <td><span class="severity-pill {sev_class}">{ev["severity"]}</span></td>
+                <td>{html.escape(ev["detail"])}</td>
+              </tr>
+            ''')
+        critical_html = f'''
+          <div class="chart-box" style="padding:0">
+            <table class="events-table">
+              <thead>
+                <tr>
+                  <th>Hora</th>
+                  <th>Tipo</th>
+                  <th>Severidad</th>
+                  <th>Detalle</th>
+                </tr>
+              </thead>
+              <tbody>{"".join(ev_rows)}</tbody>
+            </table>
+          </div>
+        '''
+    else:
+        critical_html = '''
+          <div class="info-box green">
+            <h3>Sin eventos críticos</h3>
+            <p>Durante el período analizado no se detectaron microcortes mayores a 100 ms ni caídas de conexiones TCP. El enlace operó en condiciones óptimas.</p>
+          </div>
+        '''
+
+    # === DIAGNOSIS ===
+    diag_parts = []
+
+    # Análisis de patrones horarios
+    cuts_by_hour_local = defaultdict(int)
+    for c in data["microcuts"]:
+        h_local = to_local(c["timestamp"]).hour
+        cuts_by_hour_local[h_local] += 1
+
+    if cuts_by_hour_local:
+        max_hour = max(cuts_by_hour_local, key=cuts_by_hour_local.get)
+        max_count = cuts_by_hour_local[max_hour]
+        total_cuts = sum(cuts_by_hour_local.values())
+        if max_count > total_cuts * 0.25 and max_count > 5:
+            diag_parts.append(f'''
+              <div class="info-box yellow">
+                <h3>Concentración temporal sospechosa</h3>
+                <p>Se detectó una concentración de <code>{max_count} microcortes</code> a las <code>{max_hour:02d}:00 hora Colombia</code> ({(max_hour+4)%24:02d}:00 UTC). Esto representa el {max_count*100/total_cuts:.0f}% del total del día.</p>
+                <p>Causas probables:</p>
+                <ul>
+                  <li>Proceso programado en tu red: backup, replicación de BD, snapshot.</li>
+                  <li>Mantenimiento programado de un proveedor intermedio.</li>
+                  <li>Job batch que satura algún enlace.</li>
+                </ul>
+                <p><strong>Acción recomendada</strong>: revisa qué procesos están programados a esa hora y correlaciona con logs de tus aplicaciones.</p>
+              </div>
+            ''')
+
+    # Detectar cambio de ruta (latencia min cambia significativamente)
+    if data["latency"] and len(data["latency"]) > 100:
+        first_third = data["latency"][:len(data["latency"])//3]
+        last_third = data["latency"][2*len(data["latency"])//3:]
+        min1 = min(r["min_us"] for r in first_third) / 1000
+        min2 = min(r["min_us"] for r in last_third) / 1000
+        diff = abs(min1 - min2)
+        if diff > 3:  # más de 3 ms de diferencia en el min absoluto = probable reroute
+            diag_parts.append(f'''
+              <div class="info-box blue">
+                <h3>Cambio de ruta detectado</h3>
+                <p>La latencia mínima absoluta cambió <code>{diff:.1f} ms</code> durante el día (de {min1:.1f} ms a {min2:.1f} ms). Cuando el min absoluto cambia (no solo la mediana), indica que el tráfico está tomando un <strong>camino físico distinto</strong>, no que la congestión bajó.</p>
+                <p>Causas típicas: reroute BGP, failover de enlaces, activación de un path alterno por horario.</p>
+                <p><strong>Para confirmar</strong>: corre <code>mtr -n -c 100 -r {data["latency"][0].get("dest", "&lt;peer&gt;")}</code> en ambos momentos del día y compara los hops.</p>
+              </div>
+            ''')
+
+    # Si TCP estable pero UDP no
+    if summary["total_disconnects"] == 0 and summary["total_microcuts"] > 5:
+        diag_parts.append(f'''
+          <div class="info-box blue">
+            <h3>Por qué TCP no se cayó pero UDP sí</h3>
+            <p>Tus aplicaciones TCP tradicionales (web, bases de datos, APIs) <strong>no sufrieron</strong>. TCP retransmite paquetes perdidos automáticamente y enmascara microcortes de hasta cientos de milisegundos. Sólo si la pérdida es severa y sostenida, la conexión se cae.</p>
+            <p>Los microcortes UDP que vemos sí afectan aplicaciones de <strong>tiempo real</strong>:</p>
+            <ul>
+              <li><strong>VoIP/SIP</strong>: cortes audibles en llamadas (>50 ms = nota la diferencia).</li>
+              <li><strong>Videoconferencia</strong>: frames perdidos, audio entrecortado.</li>
+              <li><strong>Streaming en vivo</strong>: buffering, glitches.</li>
+              <li><strong>Trading de baja latencia</strong>: oportunidades perdidas.</li>
+              <li><strong>Gaming / VPN UDP</strong>: lag, desconexiones aparentes.</li>
+            </ul>
+          </div>
+        ''')
+
+    if not diag_parts:
+        diag_parts.append('''
+          <div class="info-box green">
+            <h3>Red en condiciones óptimas</h3>
+            <p>El análisis no detectó patrones sospechosos. Latencia estable, sin caídas TCP y pérdida UDP en valores excelentes. No se requieren acciones.</p>
+          </div>
+        ''')
+
+    diagnosis_html = "".join(diag_parts)
+
+    # === CHART DATA (JSON) ===
+    # Latency time series
+    lat_data = data["latency"]
+    chart_labels = [to_local(r["timestamp"]).strftime("%H:%M") for r in lat_data]
+    chart_data = {
+        "latency": {
+            "labels": chart_labels,
+            "min": [r["min_us"]/1000 for r in lat_data],
+            "p50": [r["p50_us"]/1000 for r in lat_data],
+            "p99": [r["p99_us"]/1000 for r in lat_data],
+            "max": [r["max_us"]/1000 for r in lat_data],
+        },
+        "cutsDist": {
+            "labels": ["< 5 ms", "5-10 ms", "10-50 ms", "50-100 ms", "100-500 ms", "≥ 500 ms"],
+            "values": [
+                summary.get("cut_dist", {}).get("<5ms", 0),
+                summary.get("cut_dist", {}).get("5-10ms", 0),
+                summary.get("cut_dist", {}).get("10-50ms", 0),
+                summary.get("cut_dist", {}).get("50-100ms", 0),
+                summary.get("cut_dist", {}).get("100-500ms", 0),
+                summary.get("cut_dist", {}).get(">=500ms", 0),
+            ],
+            "colors": ["#4ade80", "#86efac", "#fbbf24", "#fb923c", "#ef4444", "#dc2626"],
+        },
+        "cutsByHour": {
+            "labels": [f"{h:02d}" for h in range(24)],
+            "values": [cuts_by_hour_local.get(h, 0) for h in range(24)],
+            "colors": [
+                "#dc2626" if cuts_by_hour_local.get(h, 0) > 10
+                else "#fb923c" if cuts_by_hour_local.get(h, 0) > 3
+                else "#fbbf24" if cuts_by_hour_local.get(h, 0) > 0
+                else "#374151"
+                for h in range(24)
+            ],
+        },
+        "cutsTimeline": [
+            {"x": chart_labels.index(to_local(c["timestamp"]).strftime("%H:%M"))
+                  if to_local(c["timestamp"]).strftime("%H:%M") in chart_labels else 0,
+             "y": c["duration_ms"]}
+            for c in data["microcuts"]
+        ],
+        "timeLabels": chart_labels,
+    }
+
+    # Sustituir placeholders
+    out = HTML_TEMPLATE
+    out = out.replace("__DAY__", day)
+    out = out.replace("__DAY_LOCAL__", day)
+    out = out.replace("__GENERATED__", datetime.now(COLOMBIA_TZ).strftime("%Y-%m-%d %H:%M:%S %Z"))
+    out = out.replace("__UDP_RATE__", str(udp_rate))
+    out = out.replace("__KPI_CARDS__", "".join(kpi_html))
+    out = out.replace("__EXECUTIVE_SUMMARY__", exec_summary)
+    out = out.replace("__HEATMAP__", heatmap_html)
+    out = out.replace("__HOURLY_TABLE__", "".join(hourly_rows))
+    out = out.replace("__CRITICAL_EVENTS__", critical_html)
+    out = out.replace("__DIAGNOSIS__", diagnosis_html)
+    out = out.replace("__CHART_DATA__", json.dumps(chart_data, default=str))
+
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser(description="Generador de reporte HTML netmon")
+    p.add_argument("--day", required=True, help="YYYY-MM-DD (UTC)")
+    p.add_argument("--base-dir", default="/var/log/netmon")
+    p.add_argument("--output", default=None, help="archivo de salida (default: ./netmon-report-DAY.html)")
+    p.add_argument("--udp-rate", type=int, default=1000)
+    args = p.parse_args()
+
+    data = build_data(args.base_dir, args.day)
+    if not data["latency"] and not data["udp"]:
+        print(f"[!] No se encontraron datos en {args.base_dir} para el día {args.day}", file=sys.stderr)
+        sys.exit(1)
+
+    html_out = render_html(data, args.day, args.base_dir, udp_rate=args.udp_rate)
+    output = args.output or f"netmon-report-{args.day}.html"
+    with open(output, "w", encoding="utf-8") as f:
+        f.write(html_out)
+    print(f"[+] Reporte generado: {output}")
+    print(f"    Abre con: firefox {output}")
+    print(f"    O cópialo a tu PC con: scp <server>:{os.path.abspath(output)} .")
+
+
+if __name__ == "__main__":
+    main()

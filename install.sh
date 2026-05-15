@@ -99,7 +99,7 @@ install_config() {
 install_bins() {
     echo "[+] Instalando ejecutables en /usr/local/bin..."
     for f in netmon-server netmon-latency netmon-microcuts \
-             netmon-connections netmon-report netmon-ctl; do
+             netmon-connections netmon-report netmon-html-report netmon-ctl; do
         if [ -f "$SCRIPT_DIR/bin/$f" ]; then
             cp "$SCRIPT_DIR/bin/$f" /usr/local/bin/
             chmod 755 /usr/local/bin/"$f"
